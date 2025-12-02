@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2021-2025, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <trace/hooks/cpufreq.h>
@@ -118,9 +118,12 @@ static void android_rvh_cpu_capacity_show(void *unused,
 u8 contiguous_yielding_windows;
 unsigned int total_yield_cnt;
 unsigned int total_sleep_cnt;
+u64 frame_size_ns;
 
-static u64 frame_from_ravg_window(void)
+static u64 get_frame_time(void)
 {
+	if (frame_size_ns > 0)
+		return frame_size_ns;
 	if (sched_ravg_window <= SCHED_RAVG_8MS_WINDOW)
 		return FRAME120_WINDOW_NSEC;
 	if (sched_ravg_window == SCHED_RAVG_12MS_WINDOW)
@@ -275,10 +278,10 @@ static void walt_do_sched_yield_before(void *unused, long *skip)
 				rq_unlock_irqrestore(rq, &rf);
 				current_ts = rq->clock;
 				if (current_ts > wts->yield_ts + MIN_FRAME_YIELD_INTERVAL_NSEC) {
-					frame = frame_from_ravg_window();
+					frame = get_frame_time();
 					delta = current_ts - wts->yield_ts;
 					wts->yield_total_sleep_usec = 0;
-					if (frame > delta) {
+					if (frame > delta + YIELD_SLEEP_HEADROOM) {
 						sleep_nsec = (frame - delta) - YIELD_SLEEP_HEADROOM;
 						wts->yield_total_sleep_usec = sleep_nsec /
 										NSEC_PER_USEC;

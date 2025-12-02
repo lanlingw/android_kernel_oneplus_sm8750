@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2025, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/kmemleak.h>
@@ -1104,6 +1104,24 @@ static int sched_sibling_cluster_handler(struct ctl_table *table, int write,
 	return ret;
 }
 
+static unsigned int sysctl_frame_rate;
+static int walt_frame_rate_handler(struct ctl_table *table, int write,
+				       void __user *buffer, size_t *lenp,
+				       loff_t *ppos)
+{
+	int ret = -EACCES;
+
+	ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+	if (!ret && write) {
+		if (sysctl_frame_rate > 0)
+			frame_size_ns = NSEC_PER_SEC / sysctl_frame_rate;
+		else
+			frame_size_ns = 0;
+	}
+
+	return ret;
+}
+
 static struct ctl_table cluster_01[] = {
 	{
 		.procname	= "load_sync_settings",
@@ -2107,6 +2125,15 @@ static struct ctl_table walt_table[] = {
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= SYSCTL_ZERO,
 		.extra2		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "sched_frame_rate",
+		.data		= &sysctl_frame_rate,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= walt_frame_rate_handler,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_INT_MAX,
 	},
 	{ }
 };
