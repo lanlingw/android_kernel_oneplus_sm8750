@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * Copyright (c) 2018-2020, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2023, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/mhi.h>
@@ -54,6 +54,20 @@ static void qcom_mhi_qrtr_ul_callback(struct mhi_device *mhi_dev,
 	complete_all(&qdev->ringfull);
 }
 
+static void qcom_mhi_qrtr_status_cb(struct mhi_device *mhi_dev, enum mhi_callback reason)
+{
+	struct qrtr_mhi_dev *qdev = dev_get_drvdata(&mhi_dev->dev);
+
+	if (!qdev || reason != MHI_CB_FATAL_ERROR)
+		return;
+
+	WRITE_ONCE(qdev->abort_tx, true);
+	complete_all(&qdev->prepared);
+	complete_all(&qdev->ringfull);
+
+	pr_info("%s:Unblock pending tx\n", __func__);
+}
+
 /* Send data over MHI */
 static int __qcom_mhi_qrtr_send(struct qrtr_endpoint *ep, struct sk_buff *skb)
 {
@@ -92,13 +106,23 @@ static int qcom_mhi_qrtr_send(struct qrtr_endpoint *ep, struct sk_buff *skb)
 	int rc;
 
 	do {
-                if (qdev->abort_tx)
-                    return -EIO;
+		if (READ_ONCE(qdev->abort_tx)) {
+			kfree_skb(skb);
+			return -EIO;
+		}
 
-                reinit_completion(&qdev->ringfull);
 		rc = __qcom_mhi_qrtr_send(ep, skb);
-		if (rc == -EAGAIN)
-		   wait_for_completion(&qdev->ringfull);
+
+		if (rc == -EAGAIN) {
+			reinit_completion(&qdev->ringfull);
+			if (READ_ONCE(qdev->abort_tx)) {
+				if (skb->sk)
+					sock_put(skb->sk);
+				kfree_skb(skb);
+				return -EIO;
+			}
+			wait_for_completion(&qdev->ringfull);
+		}
 	} while (rc == -EAGAIN);
 
 	return rc;
@@ -175,7 +199,8 @@ static void qcom_mhi_qrtr_remove(struct mhi_device *mhi_dev)
 {
 	struct qrtr_mhi_dev *qdev = dev_get_drvdata(&mhi_dev->dev);
 
-	qdev->abort_tx = true;
+	WRITE_ONCE(qdev->abort_tx, true);
+	complete_all(&qdev->prepared);
 	complete_all(&qdev->ringfull);
 
 	qrtr_endpoint_unregister(&qdev->ep);
@@ -194,6 +219,7 @@ static struct mhi_driver qcom_mhi_qrtr_driver = {
 	.remove = qcom_mhi_qrtr_remove,
 	.dl_xfer_cb = qcom_mhi_qrtr_dl_callback,
 	.ul_xfer_cb = qcom_mhi_qrtr_ul_callback,
+	.status_cb = qcom_mhi_qrtr_status_cb,
 	.id_table = qcom_mhi_qrtr_id_table,
 	.driver = {
 		.name = "qcom_mhi_qrtr",
