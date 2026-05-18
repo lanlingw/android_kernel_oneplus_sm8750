@@ -376,7 +376,7 @@ int geas_update_memlat_params(int limin, int limax, int dimin, int dimax)
 	struct memlat_group *memlat_grp;
 	struct memlat_mon *mon;
 	int i, ret, grp;
-	unsigned int min_freq, max_freq;
+	int min_freq, max_freq;
 
 	for (grp = 0; grp < MAX_MEMLAT_GRPS; grp++) {
 		memlat_grp = memlat_data->groups[grp];

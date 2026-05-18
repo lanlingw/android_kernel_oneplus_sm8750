@@ -134,15 +134,22 @@ int qrtr_get_service_instance_id(unsigned int node_id, unsigned int port_id)
 	struct qrtr_server *srv;
 	struct qrtr_node *node;
 	unsigned long index;
+	unsigned int instance_id;
+	unsigned long flags;
 
 	node = xa_load(&nodes, node_id);
 	if (!node)
 		return -EINVAL;
 
+	xa_lock_irqsave(&node->servers, flags);
 	xa_for_each(&node->servers, index, srv) {
-		if (srv->node == node_id && srv->port == port_id)
-			return srv->instance;
+		if (srv->node == node_id && srv->port == port_id) {
+			instance_id = srv->instance;
+			xa_unlock_irqrestore(&node->servers, flags);
+			return instance_id;
+		}
 	}
+	xa_unlock_irqrestore(&node->servers, flags);
 
 	return -EINVAL;
 }
@@ -811,6 +818,10 @@ int qrtr_ns_init(void)
 		       PTR_ERR(qrtr_ns.task));
 		goto err_sock;
 	}
+
+	/* OPLUS_FEATURE_CAMERA_COMMON begin */
+	sched_set_fifo_low(qrtr_ns.task);
+	/* OPLUS_FEATURE_CAMERA_COMMON end */
 
 	qrtr_ns.sock->sk->sk_data_ready = qrtr_ns_data_ready;
 
