@@ -92,4 +92,7 @@ source "kernel/oplus_cpu/waker_identify/Kconfig"
 #ifdef OPLUS_FEATURE_FPGA
 source "drivers/soc/oplus/fpga_notify/Kconfig"
 #endif /* OPLUS_FEATURE_FPGA */
+
+# OPLUS BTUART UX
+source "drivers/soc/oplus/bluetooth/btuart/common/wq_dynamic_priority/Kconfig"
 endmenu
