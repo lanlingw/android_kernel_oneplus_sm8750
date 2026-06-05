@@ -89,3 +89,6 @@ obj-$(CONFIG_OPLUS_FEATURE_OSML_MONITOR) += oplus/osml_monitor/
 #ifdef OPLUS_FEATURE_FPGA
 obj-$(CONFIG_OPLUS_FPGA_NOTIFY)     += oplus/fpga_notify/
 #endif /* OPLUS_FEATURE_DFT */
+
+#OPLUS BTUART UX
+obj-$(CONFIG_OPLUS_FEATURE_BTUART_UX) += oplus/bluetooth/btuart/common/wq_dynamic_priority/
