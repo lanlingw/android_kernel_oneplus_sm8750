@@ -245,9 +245,13 @@ jobs:
           echo "=== 修改 $BUILD_BAZEL ==="
 
           if grep -q 'defconfig_fragments' "$BUILD_BAZEL"; then
-            # defconfig_fragments 已存在，将片段文件添加到列表中
-            sed -i "s/defconfig_fragments\s*=\s*\[/defconfig_fragments = [\"$FRAGMENT_FILE\", /" "$BUILD_BAZEL"
-            echo "  已将 $FRAGMENT_FILE 添加到现有 defconfig_fragments"
+            # defconfig_fragments 已存在，将片段文件添加到所有列表中
+            # BUILD.bazel 中有两种语法：
+            #   dict-style:       "defconfig_fragments": [...]   （kernel_aarch64 使用）
+            #   attribute-style:  defconfig_fragments = [...]    （microdroid 等使用）
+            sed -i "s/\"defconfig_fragments\":\s*\[/\"defconfig_fragments\": [\"$FRAGMENT_FILE\", /g" "$BUILD_BAZEL"
+            sed -i "s/defconfig_fragments\s*=\s*\[/defconfig_fragments = [\"$FRAGMENT_FILE\", /g" "$BUILD_BAZEL"
+            echo "  已将 $FRAGMENT_FILE 添加到所有 defconfig_fragments（dict + attribute 语法）"
           else
             # defconfig_fragments 不存在，在 name = "xxx" 行后添加
             LINE=$(grep -n "name = \"${TARGET_NAME}\"" "$BUILD_BAZEL" | head -1 | cut -d: -f1)
