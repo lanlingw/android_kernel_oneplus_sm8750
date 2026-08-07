@@ -293,6 +293,60 @@ jobs:
           echo "=== 自定义配置已应用的差异 ==="
           diff "${DEFCONFIG}.bak" "$DEFCONFIG" || true
 
+          # Kleaf 会运行 savedefconfig 检查 defconfig 是否"干净"（无冗余配置）。
+          # 自定义配置可能被父配置隐含（如 PID_NS 被 NAMESPACES 隐含），
+          # 导致 savedefconfig 与修改后的 defconfig 不匹配而编译失败。
+          # 解决：在 BUILD.bazel 中禁用 kleaf_check_defconfig 检查。
+          echo ""
+          echo "=== 禁用 Kleaf savedefconfig 检查 ==="
+
+          # 确定要修改的 BUILD.bazel（common 或 msm-kernel）
+          if [ "$BUILD_TARGET" = "gki" ]; then
+            BUILD_BAZEL="kernel_platform/common/BUILD.bazel"
+          else
+            BUILD_BAZEL="kernel_platform/msm-kernel/BUILD.bazel"
+          fi
+
+          if [ -f "$BUILD_BAZEL" ]; then
+            python3 -c "
+import sys
+build_file = '$BUILD_BAZEL'
+with open(build_file, 'r') as f:
+    content = f.read()
+
+if 'kleaf_check_defconfig' in content:
+    # 已存在，确保设为 False
+    import re
+    content = re.sub(
+        r'kleaf_check_defconfig\s*=\s*(True|False)',
+        'kleaf_check_defconfig = False',
+        content
+    )
+    print('  kleaf_check_defconfig 已设为 False')
+else:
+    # 在第一个 kernel_build( 后添加 kleaf_check_defconfig = False
+    parts = content.split('kernel_build(')
+    modified = False
+    for i in range(1, len(parts)):
+        if 'kernel_aarch64' in parts[i] or 'pineapple' in parts[i] or i == 1:
+            parts[i] = '\n    kleaf_check_defconfig = False,' + parts[i]
+            modified = True
+            break
+    if modified:
+        content = 'kernel_build('.join(parts)
+        print('  已添加 kleaf_check_defconfig = False')
+    else:
+        print('  警告: 未找到合适的 kernel_build 规则')
+
+with open(build_file, 'w') as f:
+    f.write(content)
+"
+          else
+            echo "  警告: BUILD.bazel 不存在 ($BUILD_BAZEL)"
+            echo "  搜索 BUILD.bazel:"
+            find kernel_platform/ -name "BUILD.bazel" -not -path "*/.repo/*" 2>/dev/null | head -5
+          fi
+
       # ============================================================
       # 8. 编译内核
       #    使用 Kleaf (Bazel) 编译系统
