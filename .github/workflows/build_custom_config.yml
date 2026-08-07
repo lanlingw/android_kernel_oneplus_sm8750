@@ -309,15 +309,35 @@ jobs:
 
           if [ -f "$BUILD_BAZEL" ]; then
             echo "=== 修改 $BUILD_BAZEL ==="
+
+            # 确定要查找的 target 名称
+            if [ "$BUILD_TARGET" = "gki" ]; then
+              TARGET_NAME="kernel_aarch64"
+            else
+              TARGET_NAME="pineapple"
+            fi
+
             # 检查是否已有 kleaf_check_defconfig
             if grep -q "kleaf_check_defconfig" "$BUILD_BAZEL"; then
-              # 已存在，替换为 False
               sed -i 's/kleaf_check_defconfig\s*=\s*\(True\|False\)/kleaf_check_defconfig = False/' "$BUILD_BAZEL"
               echo "  kleaf_check_defconfig 已设为 False"
             else
-              # 在第一个 kernel_build( 后添加 kleaf_check_defconfig = False
-              sed -i '0,/kernel_build(/s/kernel_build(/kernel_build(\n    kleaf_check_defconfig = False,/' "$BUILD_BAZEL"
-              echo "  已添加 kleaf_check_defconfig = False"
+              # 精确定位含 name = "$TARGET_NAME" 的 kernel_build( 规则
+              LINE=$(grep -n 'kernel_build(' "$BUILD_BAZEL" | cut -d: -f1 | while read l; do
+                if sed -n "${l},$((l+5))p" "$BUILD_BAZEL" | grep -q "name = \"${TARGET_NAME}\""; then
+                  echo "$l"
+                  break
+                fi
+              done)
+
+              if [ -n "$LINE" ]; then
+                sed -i "${LINE}a\\    kleaf_check_defconfig = False," "$BUILD_BAZEL"
+                echo "  已添加 kleaf_check_defconfig = False (第 $LINE 行后)"
+              else
+                echo "  警告: 未找到 kernel_build(name = $TARGET_NAME)"
+                echo "  BUILD.bazel 中的 kernel_build 调用:"
+                grep -n 'kernel_build(' "$BUILD_BAZEL" | head -10
+              fi
             fi
           else
             echo "  警告: BUILD.bazel 不存在 ($BUILD_BAZEL)"
