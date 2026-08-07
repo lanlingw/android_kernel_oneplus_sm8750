@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       CONFIG_CHANGES:
-        description: '只填入你要修改的 CONFIG (多个用空格隔开，如 CONFIG_BPF_SYSCALL=y CONFIG_KPROBES=y)'
+        description: '需要修改/开启的 CONFIG (多个用空格隔开，如 CONFIG_BPF_SYSCALL=y CONFIG_KPROBES=y)'
         required: true
         default: 'CONFIG_BPF_SYSCALL=y'
         type: string
@@ -23,19 +23,23 @@ jobs:
         remove-android: 'true'
         remove-haskell: 'true'
 
-    - name: Install Dependencies
+    - name: Install All Kernel Build Dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y \
           build-essential bc bison flex libssl-dev libelf-dev \
-          cpio zip unzip git wget clang lld python3 python-is-python3
+          cpio zip unzip git wget clang lld python3 python3-pip python-is-python3 \
+          libncurses5-dev libtinfo5 dwarves lz4 zstd libfl-dev libffi-dev raw2elf \
+          gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu crossbuild-essential-arm64 \
+          device-tree-compiler libcap-dev libmpc-dev libgmp-dev libmpfr-dev \
+          rsync kmod m4 libsqlite3-dev
+        
+        # 补全高通 DTS 与内核脚本所需的 Python 依赖库
+        pip3 install --break-system-packages pyyaml jinja2 ply
 
-    - name: Checkout OnePlus SM8750 Source
+    - name: Checkout Forked Repository
       uses: actions/checkout@v4
       with:
-        repository: 'OnePlusOSS/android_kernel_oneplus_sm8750'
-        ref: 'oneplus/sm8750_b_16.0.0_pad_2_pro'
-        path: 'src'
         fetch-depth: 1
 
     - name: Setup AOSP Clang 18 Toolchain
@@ -45,50 +49,59 @@ jobs:
         tar -xzf clang-r522817.tar.gz -C $GITHUB_WORKSPACE/clang
         rm clang-r522817.tar.gz
 
-    - name: Inject Custom Configs & Bypass KMI Check
+    - name: Locate Kernel Source Root
       run: |
-        # 自动定位内核根目录
-        CD_DIR="src"
-        [ -d "src/kernel_platform/common" ] && CD_DIR="src/kernel_platform/common"
-        [ -d "src/common" ] && CD_DIR="src/common"
-        cd $CD_DIR
+        # 搜寻 gki_defconfig 所在的实际相对路径
+        GKI_DEFCONFIG_PATH=$(find $GITHUB_WORKSPACE -name "gki_defconfig" -type f | head -n 1)
+        
+        if [ -z "$GKI_DEFCONFIG_PATH" ]; then
+          echo "::error::当前仓库中没有找到 gki_defconfig！这说明该仓库仅包含 Vendor 驱动/模块，不包含 GKI 内核源码。"
+          exit 1
+        fi
+
+        # 根据 gki_defconfig (arch/arm64/configs/gki_defconfig) 向上反推出 Linux 内核根目录
+        REAL_KDIR=$(dirname $(dirname $(dirname $(dirname "$GKI_DEFCONFIG_PATH"))))
+        echo "REAL_KDIR=$REAL_KDIR" >> $GITHUB_ENV
+        echo "探测到内核源码根目录位于: $REAL_KDIR"
+
+    - name: Inject Custom Configs
+      run: |
+        cd ${{ env.REAL_KDIR }}
 
         export ARCH=arm64
-        # 1. 生成基础 GKI 配置
+        # 1. 生成官方 GKI 基础配置
         make ARCH=arm64 gki_defconfig
 
-        # 2. 禁用 KMI/ABI 白名单强制校验（修改 CONFIG 必须关闭此项，否则编译直接中断）
-        ./scripts/config --file .config --disable CONFIG_TRIM_UNUSED_KSYMS
-        ./scripts/config --file .config --disable CONFIG_UNUSED_KSYMS_WHITELIST
+        # 2. 彻底禁用阻碍自定义 CONFIG 编译的 KMI 白名单校验
+        ./scripts/config --file .config --disable CONFIG_TRIM_UNUSED_KSYMS || true
+        ./scripts/config --file .config --disable CONFIG_UNUSED_KSYMS_WHITELIST || true
+        ./scripts/config --file .config --disable CONFIG_SECTION_MISMATCH_WARN_ONLY || true
 
-        # 3. 循环写入你输入的自定义 CONFIG
+        # 3. 解析并注入自定义 CONFIG 参数
         CONFIG_LIST="${{ inputs.CONFIG_CHANGES }}"
-        echo "Injecting: $CONFIG_LIST"
+        echo "Injecting Custom Configs: $CONFIG_LIST"
         for item in $CONFIG_LIST; do
           KEY=$(echo $item | cut -d'=' -f1)
           VAL=$(echo $item | cut -d'=' -f2)
           if [ "$VAL" = "y" ]; then
             ./scripts/config --file .config --enable "$KEY"
-          elif [ "$VAL" = "m" ]; then
-            ./scripts/config --file .config --module "$KEY"
           elif [ "$VAL" = "n" ]; then
             ./scripts/config --file .config --disable "$KEY"
+          elif [ "$VAL" = "m" ]; then
+            ./scripts/config --file .config --module "$KEY"
           else
             ./scripts/config --file .config --set-val "$KEY" "$VAL"
           fi
         done
 
-        # 4. 自动补全/刷新依赖项
-        make ARCH=arm64 LLVM=1 olddefconfig
+        # 4. 刷新依赖关系
+        export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
+        make ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
 
-    - name: Compile Custom Kernel
+    - name: Compile Custom Kernel Image
       run: |
         export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
-        
-        CD_DIR="src"
-        [ -d "src/kernel_platform/common" ] && CD_DIR="src/kernel_platform/common"
-        [ -d "src/common" ] && CD_DIR="src/common"
-        cd $CD_DIR
+        cd ${{ env.REAL_KDIR }}
 
         export ARCH=arm64
         export SUBARCH=arm64
@@ -96,21 +109,22 @@ jobs:
         export LLVM=1
         export LLVM_IAS=1
         export CLANG_TRIPLE=aarch64-linux-gnu-
-        export CROSS_COMPILE=aarch64-linux-android-
+        export CROSS_COMPILE=aarch64-linux-gnu-
 
         # 编译纯内核 Image
-        make -j$(nproc) ARCH=arm64 LLVM=1 Image
+        make -j$(nproc) ARCH=arm64 LLVM=1 LLVM_IAS=1 KCFLAGS="-w" Image
 
-    - name: Upload Artifact
+    - name: Pack and Upload Artifact
       run: |
         mkdir -p $GITHUB_WORKSPACE/output
-        IMAGE_PATH=$(find $GITHUB_WORKSPACE/src -name "Image" -type f | head -n 1)
+        IMAGE_PATH=$(find ${{ env.REAL_KDIR }} -name "Image" -type f | head -n 1)
         if [ -n "$IMAGE_PATH" ]; then
+          echo "Image 编译成功，位于: $IMAGE_PATH"
           cp "$IMAGE_PATH" $GITHUB_WORKSPACE/output/
           cd $GITHUB_WORKSPACE/output
           zip -r Custom_Config_GKI_Image.zip Image
         else
-          echo "Error: Image not found!"
+          echo "Error: 未能找到编译出的 Image 文件，编译中断！"
           exit 1
         fi
 
