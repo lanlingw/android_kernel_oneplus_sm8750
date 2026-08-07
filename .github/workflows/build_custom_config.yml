@@ -275,6 +275,36 @@ jobs:
           echo "=== 验证修改 ==="
           grep -n -A 2 'defconfig_fragments' "$BUILD_BAZEL" | head -10
 
+          # 诊断：查看 BUILD.bazel 中 kernel_aarch64 规则的完整结构
+          echo ""
+          echo "=== BUILD.bazel 中 kernel_aarch64 规则上下文 (前 60 行) ==="
+          LINE=$(grep -n 'name = "kernel_aarch64"' "$BUILD_BAZEL" | head -1 | cut -d: -f1)
+          if [ -n "$LINE" ]; then
+            START=$((LINE > 30 ? LINE - 30 : 1))
+            END=$((LINE + 30))
+            sed -n "${START},${END}p" "$BUILD_BAZEL"
+          fi
+
+          # 诊断：检查 gki_defconfig 中 PID_NS 的设置
+          echo ""
+          echo "=== gki_defconfig 中的命名空间配置 ==="
+          DEFCONFIG="$KERNEL_DIR/arch/arm64/configs/gki_defconfig"
+          if [ -f "$DEFCONFIG" ]; then
+            grep -i "PID_NS\|IPC_NS\|USER_NS\|NAMESPACES" "$DEFCONFIG" || echo "未找到相关配置"
+          fi
+
+          # 诊断：检查 Kconfig 中 PID_NS 的定义
+          echo ""
+          echo "=== Kconfig 中 PID_NS 定义 ==="
+          grep -A 5 "config PID_NS" "$KERNEL_DIR/init/Kconfig" 2>/dev/null || \
+            grep -rA 5 "config PID_NS" "$KERNEL_DIR/init/" 2>/dev/null | head -10
+
+          # 诊断：列出所有 fragment 文件
+          echo ""
+          echo "=== 所有 defconfig fragment 文件 ==="
+          find "$KERNEL_DIR" -name "*.fragment" -o -name "*.config" 2>/dev/null | \
+            grep -v ".repo" | head -15
+
       # ============================================================
       # 8. 编译内核
       #    使用 Kleaf (Bazel) 编译系统
