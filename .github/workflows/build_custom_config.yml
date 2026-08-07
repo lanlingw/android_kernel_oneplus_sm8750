@@ -1,0 +1,121 @@
+name: Build Custom Config GKI Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      CONFIG_CHANGES:
+        description: '只填入你要修改的 CONFIG (多个用空格隔开，如 CONFIG_BPF_SYSCALL=y CONFIG_KPROBES=y)'
+        required: true
+        default: 'CONFIG_BPF_SYSCALL=y'
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+    - name: Maximize Build Space
+      uses: easimon/maximize-build-space@v10
+      with:
+        root-reserve-mb: 4096
+        swap-size-mb: 2048
+        remove-dotnet: 'true'
+        remove-android: 'true'
+        remove-haskell: 'true'
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential bc bison flex libssl-dev libelf-dev \
+          cpio zip unzip git wget clang lld python3 python-is-python3
+
+    - name: Checkout OnePlus SM8750 Source
+      uses: actions/checkout@v4
+      with:
+        repository: 'OnePlusOSS/android_kernel_oneplus_sm8750'
+        ref: 'oneplus/sm8750_b_16.0.0_pad_2_pro'
+        path: 'src'
+        fetch-depth: 1
+
+    - name: Setup AOSP Clang 18 Toolchain
+      run: |
+        mkdir -p $GITHUB_WORKSPACE/clang
+        wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r522817.tar.gz
+        tar -xzf clang-r522817.tar.gz -C $GITHUB_WORKSPACE/clang
+        rm clang-r522817.tar.gz
+
+    - name: Inject Custom Configs & Bypass KMI Check
+      run: |
+        # 自动定位内核根目录
+        CD_DIR="src"
+        [ -d "src/kernel_platform/common" ] && CD_DIR="src/kernel_platform/common"
+        [ -d "src/common" ] && CD_DIR="src/common"
+        cd $CD_DIR
+
+        export ARCH=arm64
+        # 1. 生成基础 GKI 配置
+        make ARCH=arm64 gki_defconfig
+
+        # 2. 禁用 KMI/ABI 白名单强制校验（修改 CONFIG 必须关闭此项，否则编译直接中断）
+        ./scripts/config --file .config --disable CONFIG_TRIM_UNUSED_KSYMS
+        ./scripts/config --file .config --disable CONFIG_UNUSED_KSYMS_WHITELIST
+
+        # 3. 循环写入你输入的自定义 CONFIG
+        CONFIG_LIST="${{ inputs.CONFIG_CHANGES }}"
+        echo "Injecting: $CONFIG_LIST"
+        for item in $CONFIG_LIST; do
+          KEY=$(echo $item | cut -d'=' -f1)
+          VAL=$(echo $item | cut -d'=' -f2)
+          if [ "$VAL" = "y" ]; then
+            ./scripts/config --file .config --enable "$KEY"
+          elif [ "$VAL" = "m" ]; then
+            ./scripts/config --file .config --module "$KEY"
+          elif [ "$VAL" = "n" ]; then
+            ./scripts/config --file .config --disable "$KEY"
+          else
+            ./scripts/config --file .config --set-val "$KEY" "$VAL"
+          fi
+        done
+
+        # 4. 自动补全/刷新依赖项
+        make ARCH=arm64 LLVM=1 olddefconfig
+
+    - name: Compile Custom Kernel
+      run: |
+        export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
+        
+        CD_DIR="src"
+        [ -d "src/kernel_platform/common" ] && CD_DIR="src/kernel_platform/common"
+        [ -d "src/common" ] && CD_DIR="src/common"
+        cd $CD_DIR
+
+        export ARCH=arm64
+        export SUBARCH=arm64
+        export CC=clang
+        export LLVM=1
+        export LLVM_IAS=1
+        export CLANG_TRIPLE=aarch64-linux-gnu-
+        export CROSS_COMPILE=aarch64-linux-android-
+
+        # 编译纯内核 Image
+        make -j$(nproc) ARCH=arm64 LLVM=1 Image
+
+    - name: Upload Artifact
+      run: |
+        mkdir -p $GITHUB_WORKSPACE/output
+        IMAGE_PATH=$(find $GITHUB_WORKSPACE/src -name "Image" -type f | head -n 1)
+        if [ -n "$IMAGE_PATH" ]; then
+          cp "$IMAGE_PATH" $GITHUB_WORKSPACE/output/
+          cd $GITHUB_WORKSPACE/output
+          zip -r Custom_Config_GKI_Image.zip Image
+        else
+          echo "Error: Image not found!"
+          exit 1
+        fi
+
+    - name: Upload Kernel Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Custom-Config-GKI-Kernel
+        path: $GITHUB_WORKSPACE/output/Custom_Config_GKI_Image.zip
