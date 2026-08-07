@@ -155,18 +155,18 @@ jobs:
           cat .repo/local_manifests/oneplus.xml
 
       # ============================================================
-      # 6. 同步源码（浅克隆，节省时间和磁盘）
+      # 6. 同步源码（仅当前分支，不拉取 tags，节省时间和磁盘）
       # ============================================================
       - name: Sync source code
         run: |
           cd ${{ env.WORKSPACE }}
 
           # -c               仅同步当前分支
-          # --depth 1        浅克隆（不拉取历史）
           # --no-tags        不拉取 tags
+          # --no-clone-bundle 不使用 bundle 下载（避免 CDN 问题）
           # --fail-fast      遇到错误立即停止
           # -j N             并发数
-          repo sync -c --depth 1 --no-tags --fail-fast -j$(nproc)
+          repo sync -c --no-tags --no-clone-bundle --fail-fast -j$(nproc)
 
           echo ""
           echo "=== 同步完成，工作区结构 ==="
