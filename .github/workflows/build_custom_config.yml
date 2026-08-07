@@ -262,7 +262,8 @@ jobs:
 
           if [ -n "$SCRIPTS_CONFIG" ]; then
             echo "=== 使用 scripts/config 应用配置 ==="
-            echo "$CUSTOM_CONFIGS" | while IFS='=' read -r key val; do
+            # 支持逗号、分号、换行分隔
+            echo "$CUSTOM_CONFIGS" | tr ',;' '\n\n' | while IFS='=' read -r key val; do
               # 跳过空行和注释
               [ -z "$key" ] && continue
               [[ "$key" =~ ^[[:space:]]*# ]] && continue
