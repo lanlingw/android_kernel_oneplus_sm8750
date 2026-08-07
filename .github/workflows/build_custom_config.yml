@@ -42,6 +42,11 @@ on:
         options:
           - gki
           - pineapple
+      custom_configs:
+        description: '自定义内核配置（每行一个，如 CONFIG_PID_NS=y）。留空则使用默认配置。'
+        required: false
+        default: ''
+        type: string
 
 env:
   MANIFEST_URL: https://github.com/OnePlusOSS/kernel_manifest
@@ -83,7 +88,10 @@ jobs:
           MANIFEST_FILE="${{ github.event.inputs.manifest_file || 'oneplus_pad_2_pro_b.xml' }}"
           BUILD_TARGET="${{ github.event.inputs.build_target || 'gki' }}"
 
+          MANIFEST_NAME="${MANIFEST_FILE%.xml}"
+
           echo "manifest_file=$MANIFEST_FILE" >> $GITHUB_OUTPUT
+          echo "manifest_name=$MANIFEST_NAME" >> $GITHUB_OUTPUT
           echo "build_target=$BUILD_TARGET" >> $GITHUB_OUTPUT
 
           # 根据编译目标设置 Bazel target
@@ -188,7 +196,104 @@ jobs:
             ccache-${{ steps.params.outputs.build_target }}-${{ steps.params.outputs.manifest_file }}-
 
       # ============================================================
-      # 7. 编译内核
+      # 7. 应用自定义内核配置
+      #    用户可通过 workflow input 传入自定义 CONFIG 选项
+      #    追加到 defconfig（内核配置系统后值优先，自动覆盖重复项）
+      # ============================================================
+      - name: Apply custom kernel configs
+        run: |
+          cd ${{ env.WORKSPACE }}
+          CUSTOM_CONFIGS="${{ github.event.inputs.custom_configs }}"
+
+          if [ -z "$CUSTOM_CONFIGS" ]; then
+            echo "无自定义配置，使用默认内核配置"
+            exit 0
+          fi
+
+          echo "=== 自定义内核配置 ==="
+          echo "$CUSTOM_CONFIGS"
+          echo ""
+
+          # 根据 build_target 定位 defconfig
+          BUILD_TARGET="${{ steps.params.outputs.build_target }}"
+          DEFCONFIG=""
+
+          if [ "$BUILD_TARGET" = "gki" ]; then
+            # GKI 内核 defconfig
+            for f in \
+              kernel_platform/common/arch/arm64/configs/gki_defconfig \
+              common/arch/arm64/configs/gki_defconfig; do
+              if [ -f "$f" ]; then
+                DEFCONFIG="$f"
+                break
+              fi
+            done
+          else
+            # 设备内核 defconfig（pineapple）
+            DEFCONFIG=$(find kernel_platform/msm-kernel/arch/arm64/configs/ \
+              -name "*pineapple*defconfig*" 2>/dev/null | head -1)
+            [ -z "$DEFCONFIG" ] && DEFCONFIG=$(find . -name "pineapple_defconfig" \
+              -not -path "*/.repo/*" 2>/dev/null | head -1)
+          fi
+
+          if [ -z "$DEFCONFIG" ] || [ ! -f "$DEFCONFIG" ]; then
+            echo "错误: 找不到 defconfig 文件"
+            echo "搜索所有 arm64 defconfig:"
+            find . -path "*/arch/arm64/configs/*" -name "*defconfig*" \
+              -not -path "*/.repo/*" 2>/dev/null | head -15
+            exit 1
+          fi
+
+          echo "=== 目标 defconfig: $DEFCONFIG ==="
+          echo "修改前大小: $(wc -l < "$DEFCONFIG") 行"
+          echo ""
+
+          # 备份原文件
+          cp "$DEFCONFIG" "${DEFCONFIG}.bak"
+
+          # 使用内核自带的 scripts/config 逐条应用（正确处理重复项）
+          SCRIPTS_CONFIG=""
+          for d in kernel_platform/common kernel_platform/msm-kernel common msm-kernel; do
+            if [ -f "$d/scripts/config" ]; then
+              SCRIPTS_CONFIG="$d/scripts/config"
+              break
+            fi
+          done
+
+          if [ -n "$SCRIPTS_CONFIG" ]; then
+            echo "=== 使用 scripts/config 应用配置 ==="
+            echo "$CUSTOM_CONFIGS" | while IFS='=' read -r key val; do
+              # 跳过空行和注释
+              [ -z "$key" ] && continue
+              [[ "$key" =~ ^[[:space:]]*# ]] && continue
+              # 去除空格
+              key=$(echo "$key" | tr -d '[:space:]')
+              val=$(echo "$val" | tr -d '[:space:]')
+              # 去除 CONFIG_ 前缀
+              cfg="${key#CONFIG_}"
+
+              case "$val" in
+                y) echo "  启用: $key" ; "$SCRIPTS_CONFIG" --file "$DEFCONFIG" --enable "$cfg" ;;
+                m) echo "  模块: $key" ; "$SCRIPTS_CONFIG" --file "$DEFCONFIG" --module "$cfg" ;;
+                n) echo "  禁用: $key" ; "$SCRIPTS_CONFIG" --file "$DEFCONFIG" --disable "$cfg" ;;
+                *) echo "  设置: $key=$val" ; "$SCRIPTS_CONFIG" --file "$DEFCONFIG" --set-str "$cfg" "$val" ;;
+              esac
+            done
+          else
+            # 回退：直接追加到 defconfig（后值优先）
+            echo "=== scripts/config 不可用，直接追加到 defconfig ==="
+            echo "" >> "$DEFCONFIG"
+            echo "# === User custom configs (CI) ===" >> "$DEFCONFIG"
+            echo "$CUSTOM_CONFIGS" >> "$DEFCONFIG"
+          fi
+
+          echo ""
+          echo "=== 修改后大小: $(wc -l < "$DEFCONFIG") 行 ==="
+          echo "=== 自定义配置已应用的差异 ==="
+          diff "${DEFCONFIG}.bak" "$DEFCONFIG" || true
+
+      # ============================================================
+      # 8. 编译内核
       #    使用 Kleaf (Bazel) 编译系统
       # ============================================================
       - name: Build kernel
@@ -363,7 +468,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-${{ steps.params.outputs.build_target }}-${{ steps.params.outputs.manifest_file }}
+          name: kernel-${{ steps.params.outputs.build_target }}-${{ steps.params.outputs.manifest_name }}
           path: ${{ env.WORKSPACE }}/artifacts/
           retention-days: 14
           compression-level: 6
@@ -383,6 +488,19 @@ jobs:
           echo "| Bazel target | \`${{ steps.params.outputs.bazel_target }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| 架构 | aarch64 |" >> $GITHUB_STEP_SUMMARY
           echo "| 运行时间 | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |" >> $GITHUB_STEP_SUMMARY
+
+          CUSTOM_CONFIGS="${{ github.event.inputs.custom_configs }}"
+          if [ -n "$CUSTOM_CONFIGS" ]; then
+            echo "| 自定义配置 | 已应用 |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 自定义内核配置" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "$CUSTOM_CONFIGS" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| 自定义配置 | 无（默认配置） |" >> $GITHUB_STEP_SUMMARY
+          fi
           echo "" >> $GITHUB_STEP_SUMMARY
 
           ARTIFACTS_DIR="${{ env.WORKSPACE }}/artifacts"
