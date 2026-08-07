@@ -1,135 +1,239 @@
-name: Build Custom Config GKI Kernel
+name: Build GKI Kernel (aarch64)
 
+# 触发条件：手动触发 / 推送到指定分支
 on:
   workflow_dispatch:
     inputs:
-      CONFIG_CHANGES:
-        description: '需要修改/开启的 CONFIG (多个用空格隔开，如 CONFIG_BPF_SYSCALL=y CONFIG_KPROBES=y)'
+      branch:
+        description: '要编译的内核分支'
         required: true
-        default: 'CONFIG_BPF_SYSCALL=y'
+        default: 'oneplus/sm8750_b_16.0.0_pad_2_pro'
         type: string
+  push:
+    branches:
+      - oneplus/sm8750_b_16.0.0_pad_2_pro
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+
+env:
+  # 默认编译分支（与上面 inputs 保持一致）
+  KERNEL_BRANCH: oneplus/sm8750_b_16.0.0_pad_2_pro
+  # 上游仓库地址（如果 action 运行在 fork 仓库上，会从这里拉取源码）
+  UPSTREAM_REPO: https://github.com/OnePlusOSS/android_kernel_oneplus_sm8750
+  # GKI 编译配置文件（仓库根目录下）
+  BUILD_CONFIG: build.config.gki.aarch64
+  # 编译输出目录
+  OUT_DIR: out
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    name: Build GKI aarch64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
 
     steps:
-    - name: Maximize Build Space
-      uses: easimon/maximize-build-space@v10
-      with:
-        root-reserve-mb: 4096
-        swap-size-mb: 2048
-        remove-dotnet: 'true'
-        remove-android: 'true'
-        remove-haskell: 'true'
+      # ============================================================
+      # 1. 释放磁盘空间（GitHub runner 默认仅 ~14GB 可用，内核编译需要更多）
+      # ============================================================
+      - name: Free up disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: true
 
-    - name: Install All Kernel Build Dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y \
-          build-essential bc bison flex libssl-dev libelf-dev \
-          cpio zip unzip git wget clang lld python3 python3-pip python-is-python3 \
-          libncurses5-dev libtinfo5 dwarves lz4 zstd libfl-dev libffi-dev raw2elf \
-          gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu crossbuild-essential-arm64 \
-          device-tree-compiler libcap-dev libmpc-dev libgmp-dev libmpfr-dev \
-          rsync kmod m4 libsqlite3-dev
-        
-        # 补全高通 DTS 与内核脚本所需的 Python 依赖库
-        pip3 install --break-system-packages pyyaml jinja2 ply
+      - name: Check disk space
+        run: |
+          echo "=== 磁盘可用空间 ==="
+          df -h /
+          echo "=== CPU 信息 ==="
+          nproc
+          free -h
 
-    - name: Checkout Forked Repository
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 1
-
-    - name: Setup AOSP Clang 18 Toolchain
-      run: |
-        mkdir -p $GITHUB_WORKSPACE/clang
-        wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r522817.tar.gz
-        tar -xzf clang-r522817.tar.gz -C $GITHUB_WORKSPACE/clang
-        rm clang-r522817.tar.gz
-
-    - name: Locate Kernel Source Root
-      run: |
-        # 搜寻 gki_defconfig 所在的实际相对路径
-        GKI_DEFCONFIG_PATH=$(find $GITHUB_WORKSPACE -name "gki_defconfig" -type f | head -n 1)
-        
-        if [ -z "$GKI_DEFCONFIG_PATH" ]; then
-          echo "::error::当前仓库中没有找到 gki_defconfig！这说明该仓库仅包含 Vendor 驱动/模块，不包含 GKI 内核源码。"
-          exit 1
-        fi
-
-        # 根据 gki_defconfig (arch/arm64/configs/gki_defconfig) 向上反推出 Linux 内核根目录
-        REAL_KDIR=$(dirname $(dirname $(dirname $(dirname "$GKI_DEFCONFIG_PATH"))))
-        echo "REAL_KDIR=$REAL_KDIR" >> $GITHUB_ENV
-        echo "探测到内核源码根目录位于: $REAL_KDIR"
-
-    - name: Inject Custom Configs
-      run: |
-        cd ${{ env.REAL_KDIR }}
-
-        export ARCH=arm64
-        # 1. 生成官方 GKI 基础配置
-        make ARCH=arm64 gki_defconfig
-
-        # 2. 彻底禁用阻碍自定义 CONFIG 编译的 KMI 白名单校验
-        ./scripts/config --file .config --disable CONFIG_TRIM_UNUSED_KSYMS || true
-        ./scripts/config --file .config --disable CONFIG_UNUSED_KSYMS_WHITELIST || true
-        ./scripts/config --file .config --disable CONFIG_SECTION_MISMATCH_WARN_ONLY || true
-
-        # 3. 解析并注入自定义 CONFIG 参数
-        CONFIG_LIST="${{ inputs.CONFIG_CHANGES }}"
-        echo "Injecting Custom Configs: $CONFIG_LIST"
-        for item in $CONFIG_LIST; do
-          KEY=$(echo $item | cut -d'=' -f1)
-          VAL=$(echo $item | cut -d'=' -f2)
-          if [ "$VAL" = "y" ]; then
-            ./scripts/config --file .config --enable "$KEY"
-          elif [ "$VAL" = "n" ]; then
-            ./scripts/config --file .config --disable "$KEY"
-          elif [ "$VAL" = "m" ]; then
-            ./scripts/config --file .config --module "$KEY"
+      # ============================================================
+      # 2. 决定使用哪个分支（手动触发时用输入值，推送触发时用默认值）
+      # ============================================================
+      - name: Resolve build branch
+        id: branch
+        run: |
+          if [ -n "${{ github.event.inputs.branch }}" ]; then
+            echo "branch=${{ github.event.inputs.branch }}" >> $GITHUB_OUTPUT
           else
-            ./scripts/config --file .config --set-val "$KEY" "$VAL"
+            echo "branch=${{ env.KERNEL_BRANCH }}" >> $GITHUB_OUTPUT
           fi
-        done
 
-        # 4. 刷新依赖关系
-        export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
-        make ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+      # ============================================================
+      # 3. 拉取内核源码（浅克隆指定分支，节省时间与空间）
+      # ============================================================
+      - name: Clone kernel source
+        run: |
+          # 判断当前仓库是否就是内核仓库本身（push 触发时）
+          # 如果是 fork，则从上游拉取；如果是直接在内核仓库运行，则 checkout 本仓库
+          if [ "${{ github.repository }}" = "OnePlusOSS/android_kernel_oneplus_sm8750" ]; then
+            echo "当前即为主仓库，直接 checkout"
+            exit 0
+          fi
 
-    - name: Compile Custom Kernel Image
-      run: |
-        export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
-        cd ${{ env.REAL_KDIR }}
+          # 否则从上游浅克隆指定分支
+          git clone --depth 1 \
+            -b "${{ steps.branch.outputs.branch }}" \
+            ${{ env.UPSTREAM_REPO }} kernel-src
 
-        export ARCH=arm64
-        export SUBARCH=arm64
-        export CC=clang
-        export LLVM=1
-        export LLVM_IAS=1
-        export CLANG_TRIPLE=aarch64-linux-gnu-
-        export CROSS_COMPILE=aarch64-linux-gnu-
+          cd kernel-src
+          echo "=== 最新提交信息 ==="
+          git log -1 --format='commit: %H%nauthor:  %an <%ae>%ndate:    %ci%nsubject: %s'
+          echo ""
+          echo "GKI_BUILD_CONFIG=${{ env.BUILD_CONFIG }}" >> $GITHUB_ENV
 
-        # 编译纯内核 Image
-        make -j$(nproc) ARCH=arm64 LLVM=1 LLVM_IAS=1 KCFLAGS="-w" Image
+      - name: Checkout current repo (when running on the kernel repo itself)
+        if: github.repository == 'OnePlusOSS/android_kernel_oneplus_sm8750'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.branch.outputs.branch }}
+          fetch-depth: 1
+          path: kernel-src
 
-    - name: Pack and Upload Artifact
-      run: |
-        mkdir -p $GITHUB_WORKSPACE/output
-        IMAGE_PATH=$(find ${{ env.REAL_KDIR }} -name "Image" -type f | head -n 1)
-        if [ -n "$IMAGE_PATH" ]; then
-          echo "Image 编译成功，位于: $IMAGE_PATH"
-          cp "$IMAGE_PATH" $GITHUB_WORKSPACE/output/
-          cd $GITHUB_WORKSPACE/output
-          zip -r Custom_Config_GKI_Image.zip Image
-        else
-          echo "Error: 未能找到编译出的 Image 文件，编译中断！"
-          exit 1
-        fi
+      # ============================================================
+      # 4. 安装编译依赖
+      # ============================================================
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential cpio flex git \
+            libncurses-dev libssl-dev libelf-dev \
+            python3 python3-pip python-is-python3 \
+            zip unzip wget curl lz4 ccache \
+            openjdk-17-jdk-headless \
+            dwarves zstd
 
-    - name: Upload Kernel Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: Custom-Config-GKI-Kernel
-        path: $GITHUB_WORKSPACE/output/Custom_Config_GKI_Image.zip
+          # 确认关键工具版本
+          echo "=== 工具版本 ==="
+          gcc --version | head -1
+          python3 --version
+          make --version | head -1
+
+      # ============================================================
+      # 5. 缓存编译产物（加速重复编译）
+      # ============================================================
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-gki-${{ steps.branch.outputs.branch }}-${{ github.sha }}
+          restore-keys: |
+            ccache-gki-${{ steps.branch.outputs.branch }}-
+
+      # ============================================================
+      # 6. 编译 GKI 内核
+      #    使用 Android 内核自带的 build/build.sh 脚本
+      #    通过 BUILD_CONFIG 环境变量指定 GKI 配置
+      # ============================================================
+      - name: Build GKI kernel
+        working-directory: kernel-src
+        run: |
+          echo "=== 开始编译 GKI 内核 ==="
+          echo "分支:       ${{ steps.branch.outputs.branch }}"
+          echo "Build配置:  ${{ env.BUILD_CONFIG }}"
+          echo ""
+
+          # 设置编译环境变量
+          export BUILD_CONFIG="${{ env.BUILD_CONFIG }}"
+          export OUT_DIR="$(pwd)/${{ env.OUT_DIR }}"
+          export CCACHE_DIR="$HOME/.ccache"
+          export PATH="/usr/lib/ccache:$PATH"
+
+          # 初始化 ccache
+          ccache -M 20G 2>/dev/null || true
+          ccache -z 2>/dev/null || true
+
+          # 检查 build.sh 是否存在
+          if [ ! -f "build/build.sh" ]; then
+            echo "错误: build/build.sh 不存在，请检查仓库结构"
+            exit 1
+          fi
+
+          # 执行编译
+          build/build.sh
+
+          echo ""
+          echo "=== 编译完成 ==="
+          ccache -s 2>/dev/null || true
+
+      # ============================================================
+      # 7. 收集编译产物
+      # ============================================================
+      - name: Collect build artifacts
+        working-directory: kernel-src
+        run: |
+          mkdir -p artifacts
+
+          echo "=== 查找编译产物 ==="
+          find ${{ env.OUT_DIR }} -maxdepth 4 -type f \
+            \( -name "Image" -o -name "Image.gz" -o -name "Image.gz-dtb" \
+               -o -name "vmlinux" -o -name "vmlinux.symvers" \
+               -o -name "System.map" -o -name "modules.builtin" \
+               -o -name "modules.builtin.modinfo" \) 2>/dev/null | \
+            while read f; do
+              echo "  -> $f"
+              cp -v "$f" artifacts/ 2>/dev/null
+            done
+
+          # 收集内核模块
+          echo "=== 收集内核模块 (*.ko) ==="
+          find ${{ env.OUT_DIR }} -name "*.ko" 2>/dev/null | \
+            while read f; do cp -v "$f" artifacts/ 2>/dev/null; done
+
+          # 收集 dist 分发包（如果存在）
+          echo "=== 收集 dist 分发包 ==="
+          find ${{ env.OUT_DIR }} -name "*.tar.gz" -o -name "*.zip" 2>/dev/null | \
+            while read f; do cp -v "$f" artifacts/ 2>/dev/null; done
+
+          # 收集 defconfig 和 .config
+          find ${{ env.OUT_DIR }} -name ".config" -o -name "*defconfig" 2>/dev/null | \
+            while read f; do cp -v "$f" artifacts/ 2>/dev/null; done
+
+          echo ""
+          echo "=== 最终产物列表 ==="
+          ls -lh artifacts/
+
+      # ============================================================
+      # 8. 上传编译产物到 GitHub Actions Artifacts
+      # ============================================================
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gki-kernel-aarch64-${{ steps.branch.outputs.branch }}
+          path: kernel-src/artifacts/
+          retention-days: 14
+          compression-level: 6
+
+      # ============================================================
+      # 9. 生成编译摘要（显示在 Actions 运行页面）
+      # ============================================================
+      - name: Generate build summary
+        if: always()
+        working-directory: kernel-src
+        run: |
+          echo "## GKI 内核编译摘要" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **分支**: \`${{ steps.branch.outputs.branch }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **编译配置**: \`${{ env.BUILD_CONFIG }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **架构**: aarch64" >> $GITHUB_STEP_SUMMARY
+          echo "- **运行时间**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ -d artifacts ] && [ "$(ls -A artifacts 2>/dev/null)" ]; then
+            echo "### 产物列表" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| 文件 | 大小 |" >> $GITHUB_STEP_SUMMARY
+            echo "|------|------|" >> $GITHUB_STEP_SUMMARY
+            ls -lh artifacts/ | tail -n +2 | \
+              awk '{print "| `" $NF "` | " $5 " |"}' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ⚠️ 编译失败或无产物" >> $GITHUB_STEP_SUMMARY
+          fi
