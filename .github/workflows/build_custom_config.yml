@@ -361,7 +361,59 @@ jobs:
           ccache -s 2>/dev/null || true
 
       # ============================================================
-      # 8. 收集编译产物
+      # 8. 验证内核配置
+      #    检查自定义配置是否生效
+      # ============================================================
+      - name: Verify kernel config
+        if: always()
+        run: |
+          cd ${{ env.WORKSPACE }}
+          CUSTOM_CONFIGS="${{ github.event.inputs.custom_configs }}"
+
+          echo "=== 查找编译生成的 .config ==="
+          find . -name ".config" -not -path "*/.repo/*" 2>/dev/null | head -10
+          echo ""
+
+          # 找到实际的 .config 文件
+          CONFIG_FILE=$(find . -name ".config" -not -path "*/.repo/*" \
+            -not -path "*/cache/*" 2>/dev/null | head -1)
+
+          if [ -z "$CONFIG_FILE" ]; then
+            echo "警告: 未找到 .config 文件"
+            # 搜索 defconfig
+            echo "搜索 defconfig 文件:"
+            find . -name "*.config" -path "*/out/*" -not -path "*/.repo/*" 2>/dev/null | head -10
+            CONFIG_FILE=$(find . -name "defconfig" -path "*/out/*" -not -path "*/.repo/*" 2>/dev/null | head -1)
+          fi
+
+          if [ -n "$CONFIG_FILE" ]; then
+            echo "=== .config 文件: $CONFIG_FILE ==="
+            echo "文件大小: $(wc -l < "$CONFIG_FILE") 行"
+            echo ""
+
+            # 检查自定义配置
+            if [ -n "$CUSTOM_CONFIGS" ]; then
+              echo "=== 检查自定义配置是否生效 ==="
+              echo "$CUSTOM_CONFIGS" | tr ',;' '\n\n' | sed '/^[[:space:]]*$/d' | while IFS='=' read -r key val; do
+                [ -z "$key" ] && continue
+                key=$(echo "$key" | tr -d '[:space:]')
+                val=$(echo "$val" | tr -d '[:space:]')
+                echo "  检查: $key=$val"
+                grep -i "${key#CONFIG_}" "$CONFIG_FILE" 2>/dev/null | head -3 || \
+                  echo "    未找到 $key"
+              done
+            fi
+
+            echo ""
+            echo "=== 关键命名空间配置 ==="
+            grep -i "PID_NS\|IPC_NS\|USER_NS\|NET_NS\|UTS_NS\|NAMESPACES" "$CONFIG_FILE" 2>/dev/null || \
+              echo "未找到命名空间相关配置"
+          else
+            echo "错误: 未找到任何 .config 文件"
+          fi
+
+      # ============================================================
+      # 9. 收集编译产物
       #    Bazel 输出可能在 out/bazel/output/ 或 kernel_platform/out/
       # ============================================================
       - name: Collect build artifacts
