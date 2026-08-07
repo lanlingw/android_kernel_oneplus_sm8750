@@ -214,23 +214,53 @@ jobs:
           # 诊断：查找 tools/bazel 位置
           echo "=== 查找 tools/bazel ==="
           find . -name "bazel" -path "*/tools/*" -type f 2>/dev/null | head -5
+
+          # 查找 Bazel 并确定工作区根目录（含 WORKSPACE 文件的目录）
           BAZEL=""
+          BAZEL_ROOT=""
           for candidate in tools/bazel kernel_platform/tools/bazel; do
             if [ -f "$candidate" ]; then
               BAZEL="$candidate"
+              # 工作区根目录 = tools/bazel 的上两级
+              BAZEL_ROOT=$(dirname "$(dirname "$candidate")")
               break
             fi
           done
 
           if [ -z "$BAZEL" ]; then
-            # 搜索任意 bazel 包装器
             BAZEL=$(find . -name "bazel" -type f -executable 2>/dev/null | head -1)
+            if [ -n "$BAZEL" ]; then
+              BAZEL_ROOT=$(dirname "$(dirname "$BAZEL")")
+            fi
           fi
 
+          # 查找 WORKSPACE 文件确认工作区根目录
+          echo "=== 查找 WORKSPACE 文件 ==="
+          find . -maxdepth 3 -name "WORKSPACE" -o -name "WORKSPACE.bazel" 2>/dev/null | grep -v ".repo" | head -5
+
           if [ -n "$BAZEL" ]; then
-            echo "=== 找到 Bazel: $BAZEL ==="
+            echo "=== 找到 Bazel: $BAZEL (根目录: $BAZEL_ROOT) ==="
             chmod +x "$BAZEL" 2>/dev/null || true
-            "$BAZEL" build --config=fast ${{ steps.params.outputs.bazel_target }}
+
+            # 切换到 Bazel 工作区根目录（Bazel 需从含 WORKSPACE 的目录运行）
+            cd "$BAZEL_ROOT"
+
+            # 调整 target 路径：如果工作区根是 kernel_platform/，
+            # 则 //kernel_platform/common:... → //common:...
+            TARGET="${{ steps.params.outputs.bazel_target }}"
+            if [ "$BAZEL_ROOT" = "kernel_platform" ]; then
+              TARGET=$(echo "$TARGET" | sed 's|//kernel_platform/|//|')
+            fi
+
+            echo "=== 工作目录: $(pwd) ==="
+            echo "=== Bazel: $(basename $BAZEL_ROOT)/$BAZEL → 实际路径: $BAZEL ==="
+            echo "=== 编译 target: $TARGET ==="
+            echo ""
+
+            # 使用相对于工作区根目录的 bazel 路径
+            BAZEL_REL="tools/bazel"
+            "$BAZEL_REL" build --config=fast "$TARGET"
+
           elif [ -f "kernel_platform/build_with_bazel.py" ]; then
             echo "=== 使用 build_with_bazel.py 编译 ==="
             cd kernel_platform
