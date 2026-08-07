@@ -194,19 +194,17 @@ jobs:
 
       # ============================================================
       # 8. 编译 GKI 内核
-      #    使用 Android 内核的 build/build.sh 脚本
-      #    BUILD_CONFIG 指定 GKI aarch64 配置
+      #    android15-6.6 manifest 使用 Kleaf (Bazel) 编译系统
+      #    优先 tools/bazel，回退到传统 build/build.sh
       # ============================================================
       - name: Build GKI kernel
         run: |
           cd ${{ env.WORKSPACE }}
 
           # 编译环境变量
-          export BUILD_CONFIG="${{ env.BUILD_CONFIG }}"
           export CCACHE_DIR="$HOME/.ccache"
           export PATH="/usr/lib/ccache:$PATH"
 
-          # 初始化 ccache
           ccache -M 20G 2>/dev/null || true
           ccache -z 2>/dev/null || true
 
@@ -215,27 +213,43 @@ jobs:
           echo "========================================"
           echo "Manifest 分支:  ${{ steps.params.outputs.manifest_branch }}"
           echo "内核分支:       ${{ steps.params.outputs.kernel_branch }}"
-          echo "BUILD_CONFIG:   $BUILD_CONFIG"
+          echo "BUILD_CONFIG:   ${{ env.BUILD_CONFIG }}"
           echo "编译并发数:     $(nproc)"
           echo "========================================"
           echo ""
 
-          # 验证关键文件存在
-          if [ ! -f "build/build.sh" ]; then
-            echo "错误: build/build.sh 不存在！"
-            echo "请检查 manifest 分支是否正确: ${{ steps.params.outputs.manifest_branch }}"
+          # 诊断：查看可用的编译工具
+          echo "=== 工作区根目录 ==="
+          ls -la | head -25
+          echo ""
+          echo "=== build/ 目录 ==="
+          ls build/ 2>/dev/null | head -15 || echo "build/ 不存在"
+          echo ""
+          echo "=== tools/ 目录 ==="
+          ls tools/ 2>/dev/null | head -15 || echo "tools/ 不存在"
+          echo ""
+          echo "=== common/ build 相关文件 ==="
+          ls common/BUILD.bazel common/build.config.gki.aarch64 2>/dev/null || echo "关键文件缺失"
+          echo ""
+
+          # 优先：Kleaf (Bazel) 编译（android15-6.6 主要方式）
+          if [ -f "tools/bazel" ]; then
+            echo "=== 使用 Kleaf (Bazel) 编译 ==="
+            chmod +x tools/bazel 2>/dev/null || true
+            tools/bazel build --config=fast //common:kernel_aarch64_dist
+
+          # 回退：传统 build/build.sh
+          elif [ -f "build/build.sh" ]; then
+            echo "=== 使用 build/build.sh 编译 ==="
+            export BUILD_CONFIG="${{ env.BUILD_CONFIG }}"
+            build/build.sh
+
+          else
+            echo "错误: 找不到编译工具！"
+            echo "既没有 tools/bazel 也没有 build/build.sh"
+            echo "请检查 manifest 分支: ${{ steps.params.outputs.manifest_branch }}"
             exit 1
           fi
-
-          if [ ! -f "common/${BUILD_CONFIG#common/}" ]; then
-            echo "错误: 编译配置 $BUILD_CONFIG 不存在！"
-            echo "common/ 目录内容:"
-            ls common/build.config.* 2>/dev/null
-            exit 1
-          fi
-
-          # 执行编译
-          build/build.sh
 
           echo ""
           echo "=== 编译完成 ==="
@@ -243,7 +257,8 @@ jobs:
 
       # ============================================================
       # 9. 收集编译产物
-      #    GKI 编译输出通常在 out/<branch>/dist/ 目录
+      #    Bazel (Kleaf) 输出在 out/bazel/output/
+      #    传统 build.sh 输出在 out/<branch>/dist/
       # ============================================================
       - name: Collect build artifacts
         if: always()
@@ -251,19 +266,29 @@ jobs:
           cd ${{ env.WORKSPACE }}
           mkdir -p artifacts
 
-          echo "=== 查找 dist 目录 ==="
-          find out/ -name "dist" -type d 2>/dev/null
+          echo "=== 查找产物目录 ==="
+          find out/ -type d 2>/dev/null | head -30
           echo ""
 
-          # 定位产物目录（可能是 out/android15-6.6/dist/ 或 out/dist/）
-          DIST_DIR=$(find out/ -name "dist" -type d 2>/dev/null | head -1)
+          # 搜索所有可能的产物目录（Bazel output / 传统 dist）
+          DIST_DIR=""
+          for candidate in out/bazel/output out/dist out/android15-6.6/dist; do
+            if [ -d "$candidate" ] && [ "$(ls -A $candidate 2>/dev/null)" ]; then
+              DIST_DIR="$candidate"
+              break
+            fi
+          done
+          # 回退：搜索任意名为 dist 或 output 的目录
           if [ -z "$DIST_DIR" ]; then
-            echo "未找到 dist 目录，查找 out/ 下所有产物..."
+            DIST_DIR=$(find out/ \( -name "dist" -o -name "output" \) -type d 2>/dev/null | head -1)
+          fi
+          if [ -z "$DIST_DIR" ]; then
+            echo "未找到产物目录，搜索 out/ 全目录"
             DIST_DIR="out"
           fi
 
           echo "=== 产物目录: $DIST_DIR ==="
-          ls -lh "$DIST_DIR/" 2>/dev/null | head -30
+          ls -lh "$DIST_DIR/" 2>/dev/null | head -40
           echo ""
 
           # 复制内核镜像（GKI 核心产物）
