@@ -141,7 +141,6 @@ jobs:
 
             <!-- 移除默认的 AOSP common 内核 -->
             <remove-project name="kernel/common" />
-            <remove-project name="kernel/common-6.6" />
 
             <!-- 使用 OnePlus SM8750 内核作为 common -->
             <project name="${{ env.KERNEL_REPO }}"
