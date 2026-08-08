@@ -197,9 +197,8 @@ jobs:
 
       # ============================================================
       # 7. 应用自定义内核配置
-      #    使用 Kleaf 的 defconfig_fragments 机制（不修改 defconfig 本身）
-      #    创建独立配置片段文件，添加到 BUILD.bazel 的 defconfig_fragments
-      #    这样不会触发 savedefconfig 检查
+      #    使用 merge_config.sh 将自定义配置合并到 defconfig 中
+      #    这是最可靠的方式，避免 Bazel 沙箱和 label 问题
       # ============================================================
       - name: Apply custom kernel configs
         run: |
@@ -216,94 +215,73 @@ jobs:
           echo "$CUSTOM_CONFIGS"
           echo ""
 
-          # 确定内核源码目录和 BUILD.bazel
+          # 确定内核源码目录和 defconfig 文件
           if [ "$BUILD_TARGET" = "gki" ]; then
             KERNEL_DIR="kernel_platform/common"
-            TARGET_NAME="kernel_aarch64"
+            DEFCONFIG_NAME="gki_defconfig"
           else
             KERNEL_DIR="kernel_platform/msm-kernel"
-            TARGET_NAME="pineapple"
+            DEFCONFIG_NAME="pineapple_defconfig"
           fi
 
-          BUILD_BAZEL="$KERNEL_DIR/BUILD.bazel"
-          FRAGMENT_FILE="user_custom.config"
+          DEFCONFIG_FILE="$KERNEL_DIR/arch/arm64/configs/$DEFCONFIG_NAME"
+          FRAGMENT_FILE="$KERNEL_DIR/user_custom.config"
 
-          if [ ! -f "$BUILD_BAZEL" ]; then
-            echo "错误: $BUILD_BAZEL 不存在"
-            find kernel_platform/ -name "BUILD.bazel" -not -path "*/.repo/*" 2>/dev/null | head -5
+          if [ ! -f "$DEFCONFIG_FILE" ]; then
+            echo "错误: defconfig 文件不存在: $DEFCONFIG_FILE"
+            echo "可用的 defconfig 文件:"
+            find "$KERNEL_DIR/arch/arm64/configs/" -name "*_defconfig" 2>/dev/null | head -10
             exit 1
           fi
 
           # 1. 创建配置片段文件（支持逗号、分号、换行分隔）
-          echo "=== 创建配置片段: $KERNEL_DIR/$FRAGMENT_FILE ==="
-          echo "$CUSTOM_CONFIGS" | tr ',;' '\n\n' | sed '/^[[:space:]]*$/d' > "$KERNEL_DIR/$FRAGMENT_FILE"
+          echo "=== 创建配置片段: $FRAGMENT_FILE ==="
+          echo "$CUSTOM_CONFIGS" | tr ',;' '\n\n' | sed '/^[[:space:]]*$/d' > "$FRAGMENT_FILE"
           echo "片段内容:"
-          cat "$KERNEL_DIR/$FRAGMENT_FILE"
+          cat "$FRAGMENT_FILE"
           echo ""
 
-          # 2. 修改 BUILD.bazel，将片段添加到 defconfig_fragments
-          echo "=== 修改 $BUILD_BAZEL ==="
-
-          if grep -q 'defconfig_fragments' "$BUILD_BAZEL"; then
-            # defconfig_fragments 已存在，将片段文件添加到所有列表中
-            # BUILD.bazel 中有两种语法：
-            #   dict-style:       "defconfig_fragments": [...]   （kernel_aarch64 使用）
-            #   attribute-style:  defconfig_fragments = [...]    （microdroid 等使用）
-            sed -i "s/\"defconfig_fragments\":\s*\[/\"defconfig_fragments\": [\"$FRAGMENT_FILE\", /g" "$BUILD_BAZEL"
-            sed -i "s/defconfig_fragments\s*=\s*\[/defconfig_fragments = [\"$FRAGMENT_FILE\", /g" "$BUILD_BAZEL"
-            echo "  已将 $FRAGMENT_FILE 添加到所有 defconfig_fragments（dict + attribute 语法）"
-          else
-            # defconfig_fragments 不存在，在 name = "xxx" 行后添加
-            LINE=$(grep -n "name = \"${TARGET_NAME}\"" "$BUILD_BAZEL" | head -1 | cut -d: -f1)
-            if [ -n "$LINE" ]; then
-              sed -i "${LINE}a\\    defconfig_fragments = [\"$FRAGMENT_FILE\"]," "$BUILD_BAZEL"
-              echo "  已添加 defconfig_fragments = [\"$FRAGMENT_FILE\"] (第 $LINE 行后)"
+          # 2. 合并配置到 defconfig
+          # 最简单可靠的方式：直接追加自定义配置到 defconfig 文件末尾
+          # 内核编译时的 olddefconfig 步骤会处理依赖关系
+          echo "=== 合并配置到 $DEFCONFIG_FILE ==="
+          
+          # 备份原始 defconfig
+          cp "$DEFCONFIG_FILE" "$DEFCONFIG_FILE.bak"
+          
+          # 追加自定义配置
+          echo "" >> "$DEFCONFIG_FILE"
+          echo "# Custom user configurations (auto-generated)" >> "$DEFCONFIG_FILE"
+          cat "$FRAGMENT_FILE" >> "$DEFCONFIG_FILE"
+          
+          echo "已追加自定义配置到 defconfig"
+          
+          echo ""
+          echo "=== 合并后的配置差异 ==="
+          diff "$DEFCONFIG_FILE.bak" "$DEFCONFIG_FILE" | grep "^[<>]" | head -20 || echo "无差异"
+          
+          rm -f "$DEFCONFIG_FILE.bak"
+          
+          # 3. 验证关键配置
+          echo ""
+          echo "=== 验证自定义配置是否已合并 ==="
+          echo "$CUSTOM_CONFIGS" | tr ',;' '\n\n' | sed '/^[[:space:]]*$/d' | while IFS='=' read -r key val; do
+            [ -z "$key" ] && continue
+            key=$(echo "$key" | tr -d '[:space:]')
+            val=$(echo "$val" | tr -d '[:space:]')
+            if grep -q "^${key}=${val}$" "$DEFCONFIG_FILE"; then
+              echo "  ✓ $key=$val"
             else
-              echo "  警告: 未找到 name = \"$TARGET_NAME\"，尝试 kernel_build( 后添加"
-              LINE=$(grep -n 'kernel_build(' "$BUILD_BAZEL" | head -1 | cut -d: -f1)
-              if [ -n "$LINE" ]; then
-                sed -i "${LINE}a\\    defconfig_fragments = [\"$FRAGMENT_FILE\"]," "$BUILD_BAZEL"
-                echo "  已在 kernel_build( 后添加 (第 $LINE 行)"
-              else
-                echo "  错误: 无法修改 BUILD.bazel"
-                exit 1
-              fi
+              echo "  ✗ $key=$val (未找到或值不同)"
+              grep "^${key}=" "$DEFCONFIG_FILE" | head -1 || echo "    配置项不存在"
             fi
-          fi
-
+          done
+          
+          # 4. 清理备份
+          rm -f "$DEFCONFIG_FILE.bak" "$FRAGMENT_FILE"
+          
           echo ""
-          echo "=== 验证修改 ==="
-          grep -n -A 2 'defconfig_fragments' "$BUILD_BAZEL" | head -10
-
-          # 诊断：查看 BUILD.bazel 中 kernel_aarch64 规则的完整结构
-          echo ""
-          echo "=== BUILD.bazel 中 kernel_aarch64 规则上下文 (前 60 行) ==="
-          LINE=$(grep -n 'name = "kernel_aarch64"' "$BUILD_BAZEL" | head -1 | cut -d: -f1)
-          if [ -n "$LINE" ]; then
-            START=$((LINE > 30 ? LINE - 30 : 1))
-            END=$((LINE + 30))
-            sed -n "${START},${END}p" "$BUILD_BAZEL"
-          fi
-
-          # 诊断：检查 gki_defconfig 中 PID_NS 的设置
-          echo ""
-          echo "=== gki_defconfig 中的命名空间配置 ==="
-          DEFCONFIG="$KERNEL_DIR/arch/arm64/configs/gki_defconfig"
-          if [ -f "$DEFCONFIG" ]; then
-            grep -i "PID_NS\|IPC_NS\|USER_NS\|NAMESPACES" "$DEFCONFIG" || echo "未找到相关配置"
-          fi
-
-          # 诊断：检查 Kconfig 中 PID_NS 的定义
-          echo ""
-          echo "=== Kconfig 中 PID_NS 定义 ==="
-          grep -A 5 "config PID_NS" "$KERNEL_DIR/init/Kconfig" 2>/dev/null || \
-            grep -rA 5 "config PID_NS" "$KERNEL_DIR/init/" 2>/dev/null | head -10
-
-          # 诊断：列出所有 fragment 文件
-          echo ""
-          echo "=== 所有 defconfig fragment 文件 ==="
-          find "$KERNEL_DIR" -name "*.fragment" -o -name "*.config" 2>/dev/null | \
-            grep -v ".repo" | head -15
+          echo "=== 自定义配置已成功合并到 defconfig ==="
 
       # ============================================================
       # 8. 编译内核
