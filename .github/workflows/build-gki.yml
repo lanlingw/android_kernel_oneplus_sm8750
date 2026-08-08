@@ -264,7 +264,7 @@ jobs:
               pattern = r'("make_goals":\s*_GKI_AARCH64_MAKE_GOALS,)'
               replacement = f'\\1\n        "defconfig_fragments": ["{fragment_file}"],'
 
-              new_content, count = re.subn(pattern, replacement, content)
+              new_content, count = re.subn(pattern, replacement, content, count=1)
 
               if count == 0:
                   print("ERROR: 未找到 make_goals 在 BUILD.bazel 中")
