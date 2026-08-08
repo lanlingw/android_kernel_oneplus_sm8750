@@ -197,8 +197,9 @@ jobs:
 
       # ============================================================
       # 7. 应用自定义内核配置
-      #    使用 merge_config.sh 将自定义配置合并到 defconfig 中
-      #    这是最可靠的方式，避免 Bazel 沙箱和 label 问题
+      #    使用 Kleaf 的 defconfig_fragments 机制
+      #    GKI: 修改 BUILD.bazel 中 define_common_kernels 宏的 kernel_aarch64 配置字典
+      #    MSM: 修改 pineapple.bzl + msm_kernel_la.bzl 传递 defconfig_fragments 参数
       # ============================================================
       - name: Apply custom kernel configs
         run: |
@@ -215,74 +216,156 @@ jobs:
           echo "$CUSTOM_CONFIGS"
           echo ""
 
-          # 确定内核源码目录和 defconfig 文件
+          # 确定内核源码目录
           if [ "$BUILD_TARGET" = "gki" ]; then
             KERNEL_DIR="kernel_platform/common"
-            DEFCONFIG_NAME="gki_defconfig"
           else
             KERNEL_DIR="kernel_platform/msm-kernel"
-            DEFCONFIG_NAME="pineapple_defconfig"
           fi
 
-          DEFCONFIG_FILE="$KERNEL_DIR/arch/arm64/configs/$DEFCONFIG_NAME"
-          FRAGMENT_FILE="$KERNEL_DIR/user_custom.config"
-
-          if [ ! -f "$DEFCONFIG_FILE" ]; then
-            echo "错误: defconfig 文件不存在: $DEFCONFIG_FILE"
-            echo "可用的 defconfig 文件:"
-            find "$KERNEL_DIR/arch/arm64/configs/" -name "*_defconfig" 2>/dev/null | head -10
-            exit 1
-          fi
+          FRAGMENT_FILE="user_custom.config"
+          FRAGMENT_PATH="$KERNEL_DIR/arch/arm64/configs/$FRAGMENT_FILE"
 
           # 1. 创建配置片段文件（支持逗号、分号、换行分隔）
-          echo "=== 创建配置片段: $FRAGMENT_FILE ==="
-          echo "$CUSTOM_CONFIGS" | tr ',;' '\n\n' | sed '/^[[:space:]]*$/d' > "$FRAGMENT_FILE"
+          mkdir -p "$KERNEL_DIR/arch/arm64/configs"
+          echo "=== 创建配置片段: $FRAGMENT_PATH ==="
+          echo "$CUSTOM_CONFIGS" | tr ',;' '\n\n' | sed '/^[[:space:]]*$/d' > "$FRAGMENT_PATH"
           echo "片段内容:"
-          cat "$FRAGMENT_FILE"
+          cat "$FRAGMENT_PATH"
           echo ""
 
-          # 2. 合并配置到 defconfig
-          # 最简单可靠的方式：直接追加自定义配置到 defconfig 文件末尾
-          # 内核编译时的 olddefconfig 步骤会处理依赖关系
-          echo "=== 合并配置到 $DEFCONFIG_FILE ==="
-          
-          # 备份原始 defconfig
-          cp "$DEFCONFIG_FILE" "$DEFCONFIG_FILE.bak"
-          
-          # 追加自定义配置
-          echo "" >> "$DEFCONFIG_FILE"
-          echo "# Custom user configurations (auto-generated)" >> "$DEFCONFIG_FILE"
-          cat "$FRAGMENT_FILE" >> "$DEFCONFIG_FILE"
-          
-          echo "已追加自定义配置到 defconfig"
-          
-          echo ""
-          echo "=== 合并后的配置差异 ==="
-          diff "$DEFCONFIG_FILE.bak" "$DEFCONFIG_FILE" | grep "^[<>]" | head -20 || echo "无差异"
-          
-          rm -f "$DEFCONFIG_FILE.bak"
-          
-          # 3. 验证关键配置
-          echo ""
-          echo "=== 验证自定义配置是否已合并 ==="
-          echo "$CUSTOM_CONFIGS" | tr ',;' '\n\n' | sed '/^[[:space:]]*$/d' | while IFS='=' read -r key val; do
-            [ -z "$key" ] && continue
-            key=$(echo "$key" | tr -d '[:space:]')
-            val=$(echo "$val" | tr -d '[:space:]')
-            if grep -q "^${key}=${val}$" "$DEFCONFIG_FILE"; then
-              echo "  ✓ $key=$val"
-            else
-              echo "  ✗ $key=$val (未找到或值不同)"
-              grep "^${key}=" "$DEFCONFIG_FILE" | head -1 || echo "    配置项不存在"
-            fi
-          done
-          
-          # 4. 清理备份
-          rm -f "$DEFCONFIG_FILE.bak" "$FRAGMENT_FILE"
-          
-          echo ""
-          echo "=== 自定义配置已成功合并到 defconfig ==="
+          # 2. 根据编译目标修改对应的构建文件
+          # 先将 Python 脚本写入文件（避免 YAML heredoc 缩进问题）
+          cat > /tmp/apply_custom_config.py << 'PYEOF'
+          import re
+          import sys
+          import os
 
+          build_target = sys.argv[1]
+          kernel_dir = sys.argv[2]
+          fragment_file = "arch/arm64/configs/user_custom.config"
+
+          if build_target == "gki":
+              # ============================================================
+              # GKI: 修改 BUILD.bazel 中 define_common_kernels 的 kernel_aarch64 配置
+              # ============================================================
+              build_bazel = os.path.join(kernel_dir, "BUILD.bazel")
+              print(f"=== 修改 {build_bazel} ===")
+
+              if not os.path.exists(build_bazel):
+                  print(f"错误: {build_bazel} 不存在")
+                  sys.exit(1)
+
+              with open(build_bazel, "r") as f:
+                  content = f.read()
+
+              # 在 kernel_aarch64 配置字典中，找到 "make_goals": _GKI_AARCH64_MAKE_GOALS,
+              # 在其后添加 defconfig_fragments
+              pattern = r'("make_goals":\s*_GKI_AARCH64_MAKE_GOALS,)'
+              replacement = f'\\1\n        "defconfig_fragments": ["{fragment_file}"],'
+
+              new_content, count = re.subn(pattern, replacement, content)
+
+              if count == 0:
+                  print("ERROR: 未找到 make_goals 在 BUILD.bazel 中")
+                  sys.exit(1)
+
+              with open(build_bazel, "w") as f:
+                  f.write(new_content)
+
+              print(f"已在 BUILD.bazel 的 kernel_aarch64 配置中添加 defconfig_fragments")
+
+          else:
+              # ============================================================
+              # MSM/pineapple: 修改 msm_kernel_la.bzl + pineapple.bzl
+              # ============================================================
+              msm_kernel_la = os.path.join(kernel_dir, "msm_kernel_la.bzl")
+              pineapple_bzl = os.path.join(kernel_dir, "pineapple.bzl")
+
+              print(f"=== 修改 {msm_kernel_la} + {pineapple_bzl} ===")
+
+              if not os.path.exists(msm_kernel_la):
+                  print(f"错误: {msm_kernel_la} 不存在")
+                  sys.exit(1)
+
+              if not os.path.exists(pineapple_bzl):
+                  print(f"错误: {pineapple_bzl} 不存在")
+                  sys.exit(1)
+
+              # ========== 1. 修改 msm_kernel_la.bzl ==========
+              with open(msm_kernel_la, "r") as f:
+                  content = f.read()
+
+              # 1a. 在 define_msm_la 函数签名中添加 defconfig_fragments 参数
+              content = re.sub(
+                  r'def define_msm_la\(\s*msm_target,\s*variant,\s*in_tree_module_list,\s*kmi_enforced = True,\s*boot_image_opts = boot_image_opts\(\)\):',
+                  'def define_msm_la(msm_target, variant, in_tree_module_list, kmi_enforced = True, boot_image_opts = boot_image_opts(), defconfig_fragments = []):',
+                  content
+              )
+
+              # 1b. 将 defconfig_fragments 传递给 _define_kernel_build
+              content = re.sub(
+                  r'(_define_kernel_build\(\s*target,\s*base_kernel,\s*in_tree_module_list,\s*dtb_list,\s*dtbo_list,\s*dtstree,\s*define_abi_targets,\s*kmi_enforced,\s*\))',
+                  r'\1 defconfig_fragments,',
+                  content
+              )
+
+              # 1c. 在 _define_kernel_build 函数签名中添加 defconfig_fragments 参数
+              content = re.sub(
+                  r'def _define_kernel_build\(\s*target,\s*base_kernel,\s*in_tree_module_list,\s*dtb_list,\s*dtbo_list,\s*dtstree,\s*define_abi_targets,\s*kmi_enforced\):',
+                  'def _define_kernel_build(target, base_kernel, in_tree_module_list, dtb_list, dtbo_list, dtstree, define_abi_targets, kmi_enforced, defconfig_fragments = []):',
+                  content
+              )
+
+              # 1d. 在 kernel_build 调用中添加 defconfig_fragments
+              content = re.sub(
+                  r'(kernel_build\(\s*name = target,.*?base_kernel = base_kernel,)',
+                  r'\1\n        defconfig_fragments = defconfig_fragments,',
+                  content,
+                  flags=re.DOTALL
+              )
+
+              with open(msm_kernel_la, "w") as f:
+                  f.write(content)
+
+              print("已修改 msm_kernel_la.bzl: 添加 defconfig_fragments 参数传递")
+
+              # ========== 2. 修改 pineapple.bzl ==========
+              with open(pineapple_bzl, "r") as f:
+                  content = f.read()
+
+              # 在 define_msm_la 调用中添加 defconfig_fragments 参数
+              content = re.sub(
+                  r'(define_msm_la\(\s*msm_target = target_name,\s*variant = variant,\s*in_tree_module_list = mod_list,\s*boot_image_opts = boot_image_opts\()',
+                  r'\1\n            defconfig_fragments = ["' + fragment_file + '"],',
+                  content
+              )
+
+              with open(pineapple_bzl, "w") as f:
+                  f.write(content)
+
+              print("已修改 pineapple.bzl: 传递 defconfig_fragments")
+
+          PYEOF
+
+          # 执行 Python 脚本
+          python3 /tmp/apply_custom_config.py "$BUILD_TARGET" "$KERNEL_DIR"
+
+          # 3. 验证修改
+          echo ""
+          echo "=== 验证修改结果 ==="
+          if [ "$BUILD_TARGET" = "gki" ]; then
+            grep -n 'defconfig_fragments' "$KERNEL_DIR/BUILD.bazel"
+          else
+            echo "--- msm_kernel_la.bzl ---"
+            grep -n 'defconfig_fragments' "$KERNEL_DIR/msm_kernel_la.bzl"
+            echo "--- pineapple.bzl ---"
+            grep -n 'defconfig_fragments' "$KERNEL_DIR/pineapple.bzl"
+          fi
+
+          echo ""
+          echo "=== 配置片段文件内容 ==="
+          cat "$FRAGMENT_PATH"
       # ============================================================
       # 8. 编译内核
       #    使用 Kleaf (Bazel) 编译系统
