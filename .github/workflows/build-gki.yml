@@ -319,10 +319,9 @@ jobs:
 
               # 1d. 在 kernel_build 调用中添加 defconfig_fragments
               content = re.sub(
-                  r'(kernel_build\(\s*name = target,.*?base_kernel = base_kernel,)',
+                  r'(        collect_unstripped_modules = define_abi_targets,)',
                   r'\1\n        defconfig_fragments = defconfig_fragments,',
-                  content,
-                  flags=re.DOTALL
+                  content
               )
 
               with open(msm_kernel_la, "w") as f:
@@ -503,6 +502,58 @@ jobs:
             echo "=== 关键命名空间配置 ==="
             grep -i "PID_NS\|IPC_NS\|USER_NS\|NET_NS\|UTS_NS\|NAMESPACES" "$CONFIG_FILE" 2>/dev/null || \
               echo "未找到命名空间相关配置"
+            
+            echo ""
+            echo "=== 内核模块配置 (LKM 模式) ==="
+            echo "--- 模块支持 ---"
+            grep -i "CONFIG_MODULES\|CONFIG_MODULE_UNLOAD\|CONFIG_MODULE_FORCE_LOAD\|CONFIG_MODULE_FORCE_UNLOAD" "$CONFIG_FILE" 2>/dev/null || \
+              echo "未找到模块支持配置"
+            
+            echo ""
+            echo "--- 模块压缩 ---"
+            grep -i "CONFIG_MODULE_COMPRESS\|CONFIG_MODULE_COMPRESS_GZIP\|CONFIG_MODULE_COMPRESS_XZ\|CONFIG_MODULE_COMPRESS_ZSTD" "$CONFIG_FILE" 2>/dev/null || \
+              echo "未找到模块压缩配置"
+            
+            echo ""
+            echo "--- 模块签名 ---"
+            grep -i "CONFIG_MODULE_SIG\|CONFIG_MODULE_SIG_FORCE\|CONFIG_MODULE_SIG_ALL" "$CONFIG_FILE" 2>/dev/null || \
+              echo "未找到模块签名配置"
+            
+            echo ""
+            echo "--- GKI 相关配置 ---"
+            grep -i "CONFIG_GKI\|CONFIG_ANDROID\|CONFIG_KMI" "$CONFIG_FILE" 2>/dev/null | head -10 || \
+              echo "未找到 GKI 相关配置"
+            
+            echo ""
+            echo "=== WiFi/蓝牙相关配置 ==="
+            echo "--- 无线网络核心 ---"
+            grep -i "CONFIG_WIRELESS\|CONFIG_NET\|CONFIG_MAC80211\|CONFIG_CFG80211" "$CONFIG_FILE" 2>/dev/null | head -10 || \
+              echo "未找到无线网络核心配置"
+            
+            echo ""
+            echo "--- WiFi 驱动 ---"
+            grep -i "CONFIG_WLAN\|CONFIG_ATH\|CONFIG_BRCM\|CONFIG_IWL\|CONFIG_RTL\|CONFIG_MT76\|CONFIG_WCNSS" "$CONFIG_FILE" 2>/dev/null | head -15 || \
+              echo "未找到 WiFi 驱动配置"
+            
+            echo ""
+            echo "--- 蓝牙核心 ---"
+            grep -i "CONFIG_BT\|CONFIG_BLUETOOTH" "$CONFIG_FILE" 2>/dev/null | head -10 || \
+              echo "未找到蓝牙核心配置"
+            
+            echo ""
+            echo "--- 蓝牙驱动 ---"
+            grep -i "CONFIG_BT_HCIUART\|CONFIG_BT_HCIBTUSB\|CONFIG_BT_HCIBTSDIO\|CONFIG_BT_HCIQCA" "$CONFIG_FILE" 2>/dev/null | head -10 || \
+              echo "未找到蓝牙驱动配置"
+            
+            echo ""
+            echo "--- 固件加载 ---"
+            grep -i "CONFIG_FW_LOADER\|CONFIG_EXTRA_FIRMWARE" "$CONFIG_FILE" 2>/dev/null | head -5 || \
+              echo "未找到固件加载配置"
+            
+            echo ""
+            echo "--- 射频/无线设备 ---"
+            grep -i "CONFIG_RFKILL\|CONFIG_REGULATOR" "$CONFIG_FILE" 2>/dev/null | head -5 || \
+              echo "未找到射频/无线设备配置"
           else
             echo "错误: 未找到任何 .config 文件"
           fi
@@ -568,6 +619,41 @@ jobs:
           echo "=== 收集内核模块 (*.ko) ==="
           MODULE_COUNT=$(find "$DIST_DIR" -name "*.ko" 2>/dev/null | wc -l)
           echo "找到 $MODULE_COUNT 个内核模块"
+          
+          # 诊断 WiFi/蓝牙相关模块
+          echo ""
+          echo "=== WiFi/蓝牙相关模块 ==="
+          echo "--- WiFi 模块 ---"
+          find "$DIST_DIR" -name "*.ko" 2>/dev/null | grep -iE "wlan|wifi|cfg80211|mac80211|qca|wcn|ath|brcm|iwl|rtl|mt76" | head -20 || echo "未找到 WiFi 模块"
+          
+          echo ""
+          echo "--- 蓝牙模块 ---"
+          find "$DIST_DIR" -name "*.ko" 2>/dev/null | grep -iE "bluetooth|bt|hci" | head -20 || echo "未找到蓝牙模块"
+          
+          echo ""
+          echo "--- 射频/无线模块 ---"
+          find "$DIST_DIR" -name "*.ko" 2>/dev/null | grep -iE "rfkill|regulator|wireless" | head -10 || echo "未找到射频/无线模块"
+          
+          # 检查模块依赖关系
+          echo ""
+          echo "=== 模块依赖关系 ==="
+          if [ -f "$DIST_DIR/modules.dep" ]; then
+            echo "--- WiFi/蓝牙模块依赖 ---"
+            grep -iE "wlan|wifi|bluetooth|bt|qca|wcn" "$DIST_DIR/modules.dep" 2>/dev/null | head -20 || echo "未找到相关依赖"
+          else
+            echo "modules.dep 文件不存在"
+          fi
+          
+          # 检查内置模块
+          echo ""
+          echo "=== 内置模块检查 ==="
+          if [ -f "$DIST_DIR/modules.builtin" ]; then
+            echo "--- 内置的 WiFi/蓝牙模块 ---"
+            grep -iE "wlan|wifi|bluetooth|bt|cfg80211|mac80211" "$DIST_DIR/modules.builtin" 2>/dev/null | head -20 || echo "未找到内置的 WiFi/蓝牙模块"
+          else
+            echo "modules.builtin 文件不存在"
+          fi
+          
           if [ "$MODULE_COUNT" -gt 0 ] && [ "$MODULE_COUNT" -le 500 ]; then
             find "$DIST_DIR" -name "*.ko" -exec cp -v {} artifacts/ \; 2>/dev/null
           elif [ "$MODULE_COUNT" -gt 500 ]; then
