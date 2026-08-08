@@ -95,10 +95,11 @@ jobs:
           echo "build_target=$BUILD_TARGET" >> $GITHUB_OUTPUT
 
           # 根据编译目标设置 Bazel target
+          # pineapple 有多个变体（perf/consolidate），默认使用 perf
           if [ "$BUILD_TARGET" = "gki" ]; then
             BAZEL_TARGET="//kernel_platform/common:kernel_aarch64_dist"
           else
-            BAZEL_TARGET="//kernel_platform/msm-kernel:pineapple_dist"
+            BAZEL_TARGET="//kernel_platform/msm-kernel:pineapple_perf_dist"
           fi
           echo "bazel_target=$BAZEL_TARGET" >> $GITHUB_OUTPUT
 
@@ -216,12 +217,9 @@ jobs:
           echo "$CUSTOM_CONFIGS"
           echo ""
 
-          # 确定内核源码目录
-          if [ "$BUILD_TARGET" = "gki" ]; then
-            KERNEL_DIR="kernel_platform/common"
-          else
-            KERNEL_DIR="kernel_platform/msm-kernel"
-          fi
+          # 自定义配置始终应用到 common 构建
+          # 因为 pineapple 使用 mixed build，内核镜像来自 common 的 base_kernel
+          KERNEL_DIR="kernel_platform/common"
 
           FRAGMENT_FILE="user_custom.config"
           FRAGMENT_PATH="$KERNEL_DIR/arch/arm64/configs/$FRAGMENT_FILE"
@@ -234,53 +232,52 @@ jobs:
           cat "$FRAGMENT_PATH"
           echo ""
 
-          # 2. 根据编译目标修改对应的构建文件
-          # 先将 Python 脚本写入文件（避免 YAML heredoc 缩进问题）
+          # 2. 将 Python 脚本写入文件并执行
           cat > /tmp/apply_custom_config.py << 'PYEOF'
           import re
           import sys
           import os
 
           build_target = sys.argv[1]
-          kernel_dir = sys.argv[2]
           fragment_file = "arch/arm64/configs/user_custom.config"
+          kernel_dir = "kernel_platform/common"  # 始终修改 common 构建
 
-          if build_target == "gki":
-              # ============================================================
-              # GKI: 修改 BUILD.bazel 中 define_common_kernels 的 kernel_aarch64 配置
-              # ============================================================
-              build_bazel = os.path.join(kernel_dir, "BUILD.bazel")
-              print(f"=== 修改 {build_bazel} ===")
+          # 始终修改 common 构建（无论 gki 还是 pineapple）
+          # 因为 pineapple 使用 mixed build，内核镜像来自 common 的 base_kernel
+          build_bazel = os.path.join("kernel_platform/common", "BUILD.bazel")
+          print(f"=== 修改 {build_bazel} ===")
 
-              if not os.path.exists(build_bazel):
-                  print(f"错误: {build_bazel} 不存在")
-                  sys.exit(1)
+          if not os.path.exists(build_bazel):
+              print(f"错误: {build_bazel} 不存在")
+              sys.exit(1)
 
-              with open(build_bazel, "r") as f:
-                  content = f.read()
+          with open(build_bazel, "r") as f:
+              content = f.read()
 
-              # 在 kernel_aarch64 配置字典中，找到 "make_goals": _GKI_AARCH64_MAKE_GOALS,
-              # 在其后添加 defconfig_fragments
-              pattern = r'("make_goals":\s*_GKI_AARCH64_MAKE_GOALS,)'
-              replacement = f'\\1\n        "defconfig_fragments": ["{fragment_file}"],'
+          # 在 kernel_aarch64 配置字典中，找到 "make_goals": _GKI_AARCH64_MAKE_GOALS,
+          # 在其后添加 defconfig_fragments
+          pattern = r'("make_goals":\s*_GKI_AARCH64_MAKE_GOALS,)'
+          replacement = f'\\1\n        "defconfig_fragments": ["{fragment_file}"],'
 
-              new_content, count = re.subn(pattern, replacement, content, count=1)
+          new_content, count = re.subn(pattern, replacement, content, count=1)
 
-              if count == 0:
-                  print("ERROR: 未找到 make_goals 在 BUILD.bazel 中")
-                  sys.exit(1)
+          if count == 0:
+              print("ERROR: 未找到 make_goals 在 BUILD.bazel 中")
+              sys.exit(1)
 
-              with open(build_bazel, "w") as f:
-                  f.write(new_content)
+          with open(build_bazel, "w") as f:
+              f.write(new_content)
 
-              print(f"已在 BUILD.bazel 的 kernel_aarch64 配置中添加 defconfig_fragments")
+          print(f"已在 BUILD.bazel 的 kernel_aarch64 配置中添加 defconfig_fragments")
 
-          else:
+          # 如果是 pineapple，额外修改 msm-kernel（可选，用于模块配置）
+          if build_target != "gki":
               # ============================================================
               # MSM/pineapple: 修改 msm_kernel_la.bzl + pineapple.bzl
               # ============================================================
-              msm_kernel_la = os.path.join(kernel_dir, "msm_kernel_la.bzl")
-              pineapple_bzl = os.path.join(kernel_dir, "pineapple.bzl")
+              msm_kernel_dir = "kernel_platform/msm-kernel"
+              msm_kernel_la = os.path.join(msm_kernel_dir, "msm_kernel_la.bzl")
+              pineapple_bzl = os.path.join(msm_kernel_dir, "pineapple.bzl")
 
               print(f"=== 修改 {msm_kernel_la} + {pineapple_bzl} ===")
 
@@ -305,9 +302,9 @@ jobs:
 
               # 1b. 将 defconfig_fragments 传递给 _define_kernel_build
               content = re.sub(
-                  r'(_define_kernel_build\(\s*target,\s*base_kernel,\s*in_tree_module_list,\s*dtb_list,\s*dtbo_list,\s*dtstree,\s*define_abi_targets,\s*kmi_enforced,\s*\))',
-                  r'\1 defconfig_fragments,',
-                  content
+                r'(        kmi_enforced,)',
+                r'\1\n        defconfig_fragments,',
+                content
               )
 
               # 1c. 在 _define_kernel_build 函数签名中添加 defconfig_fragments 参数
@@ -348,19 +345,13 @@ jobs:
           PYEOF
 
           # 执行 Python 脚本
-          python3 /tmp/apply_custom_config.py "$BUILD_TARGET" "$KERNEL_DIR"
+          python3 /tmp/apply_custom_config.py "$BUILD_TARGET"
 
           # 3. 验证修改
           echo ""
           echo "=== 验证修改结果 ==="
-          if [ "$BUILD_TARGET" = "gki" ]; then
-            grep -n 'defconfig_fragments' "$KERNEL_DIR/BUILD.bazel"
-          else
-            echo "--- msm_kernel_la.bzl ---"
-            grep -n 'defconfig_fragments' "$KERNEL_DIR/msm_kernel_la.bzl"
-            echo "--- pineapple.bzl ---"
-            grep -n 'defconfig_fragments' "$KERNEL_DIR/pineapple.bzl"
-          fi
+          echo "--- common/BUILD.bazel ---"
+          grep -n 'defconfig_fragments' "kernel_platform/common/BUILD.bazel"
 
           echo ""
           echo "=== 配置片段文件内容 ==="
