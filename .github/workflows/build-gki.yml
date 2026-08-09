@@ -231,6 +231,16 @@ jobs:
           echo "片段内容:"
           cat "$FRAGMENT_PATH"
           echo ""
+          
+          # 如果是 pineapple 构建，同时在 msm-kernel 目录下创建配置片段
+          if [ "$BUILD_TARGET" != "gki" ]; then
+            MSM_KERNEL_DIR="kernel_platform/msm-kernel"
+            MSM_FRAGMENT_PATH="$MSM_KERNEL_DIR/arch/arm64/configs/$FRAGMENT_FILE"
+            mkdir -p "$MSM_KERNEL_DIR/arch/arm64/configs"
+            echo "=== 创建配置片段: $MSM_FRAGMENT_PATH ==="
+            cp "$FRAGMENT_PATH" "$MSM_FRAGMENT_PATH"
+            echo "已复制到 msm-kernel 目录"
+          fi
 
           # 2. 将 Python 脚本写入文件并执行
           cat > /tmp/apply_custom_config.py << 'PYEOF'
