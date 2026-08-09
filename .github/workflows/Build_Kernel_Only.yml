@@ -162,11 +162,6 @@ jobs:
             echo "  $result"
           done
 
-          echo ""
-          echo "📋 导出完整内核配置文件..."
-          cp out/.config Final-Image/kernel.config
-          echo "✅ 配置文件已保存"
-
       - name: "📦 Collect Kernel Images"
         run: |
           cd kernel
@@ -187,6 +182,11 @@ jobs:
             cp out/arch/arm64/boot/Image.lz4 Final-Image/Image.lz4
             echo "✅ Image.lz4 已复制"
           fi
+
+          echo ""
+          echo "📋 导出完整内核配置文件..."
+          cp out/.config Final-Image/kernel.config
+          echo "✅ kernel.config 已保存"
 
           echo ""
           echo "📦 最终产物:"
