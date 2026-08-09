@@ -476,6 +476,15 @@ jobs:
               echo "✓ 已修复 walt_halt.c"
             fi
 
+            # 修复 cpufreq_walt.c 中 waltgov_get_util 未使用函数警告
+            # OnePlus 源码中该函数在某些配置下未被调用，但 -Werror 导致编译失败
+            CPUFREQ_WALT_FILE="msm-kernel/kernel/sched/walt/cpufreq_walt.c"
+            if [ -f "$CPUFREQ_WALT_FILE" ]; then
+              echo "=== 修复 cpufreq_walt.c 中 waltgov_get_util 未使用警告 ==="
+              sed -i 's/^static unsigned long waltgov_get_util/static __maybe_unused unsigned long waltgov_get_util/' "$CPUFREQ_WALT_FILE"
+              echo "✓ 已修复 cpufreq_walt.c"
+            fi
+
             # 调整 target 路径：从 //kernel_platform/... 改为 //...
             # 因为现在工作区是 kernel_platform/，不是 android-kernel/
             TARGET="${{ steps.params.outputs.bazel_target }}"
