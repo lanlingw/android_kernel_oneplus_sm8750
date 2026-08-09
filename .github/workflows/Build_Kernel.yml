@@ -67,10 +67,10 @@ jobs:
           ls -la kernel_platform/
           echo ""
           echo "📂 common" 
-          ls -la kernel_platform/common/ | head -20
+          head -20 < <(ls -la kernel_platform/common/)
           echo ""
           echo "📂 msm-kernel"
-          ls -la kernel_platform/msm-kernel/ | head -20
+          head -20 < <(ls -la kernel_platform/msm-kernel/)
 
       - name: "🔍 Check Build Inputs"
         run: |
