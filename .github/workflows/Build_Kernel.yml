@@ -28,7 +28,6 @@ jobs:
       CCACHE_MAXSIZE: 8G
       CUSTOM_CONFIG: ${{ github.event.inputs.CUSTOM_CONFIG }}
       BUILD_MODE: ${{ github.event.inputs.BUILD_MODE }}
-      KERNEL_DEFCONFIG: generic_le_defconfig
       KERNEL_VARIANT: perf
 
     steps:
@@ -166,24 +165,80 @@ jobs:
           echo ""
           echo "BUILD_MODE=${BUILD_MODE}"
           echo "KERNEL_VARIANT=${KERNEL_VARIANT}"
-          echo "🔧 使用基础配置: $KERNEL_DEFCONFIG"
 
-          # 使用官方 merge_config.sh 合并 defconfig 和 vendor 配置片段
-          # 这与 build.config.msm.sun.le 中的 apply_defconfig_fragment 逻辑一致
-          DEFCONFIG_FRAGMENTS="arch/arm64/configs/${KERNEL_DEFCONFIG} arch/arm64/configs/vendor/sun_le.config"
+          # 配置文件位于 msm-kernel 仓库 (kernel_platform/msm-kernel/arch/arm64/configs/)
+          # 当前工作目录是 kernel_platform/common，所以相对路径为 ../msm-kernel/
+          MSM_DEFCONFIG_DIR="../msm-kernel/arch/arm64/configs"
+          COMMON_DEFCONFIG_DIR="./arch/arm64/configs"
 
-          if [ "$KERNEL_VARIANT" = "debug" ]; then
-            if [ -f "arch/arm64/configs/vendor/sun_le_debug.config" ]; then
-              DEFCONFIG_FRAGMENTS="$DEFCONFIG_FRAGMENTS arch/arm64/configs/vendor/sun_le_debug.config"
-            fi
+          # 确定使用哪个 defconfig
+          DEFCONFIG_FILE=""
+          if [ -f "${MSM_DEFCONFIG_DIR}/defconfig" ]; then
+            DEFCONFIG_FILE="${MSM_DEFCONFIG_DIR}/defconfig"
+            echo "✅ 使用 msm-kernel defconfig"
+          elif [ -f "${COMMON_DEFCONFIG_DIR}/defconfig" ]; then
+            DEFCONFIG_FILE="${COMMON_DEFCONFIG_DIR}/defconfig"
+            echo "✅ 使用 common defconfig"
+          else
+            echo "❌ 两个仓库都没有 defconfig 文件"
+            find ../ -maxdepth 4 -name "defconfig" 2>/dev/null | head -10
+            exit 1
           fi
 
-          echo "📋 合并配置片段: $DEFCONFIG_FRAGMENTS"
+          # 收集 vendor 配置片段 (按顺序叠加)
+          VENDOR_FRAGMENTS=""
+          if [ -d "${MSM_DEFCONFIG_DIR}/vendor" ]; then
+            echo "📂 msm-kernel vendor 配置:"
+            ls "${MSM_DEFCONFIG_DIR}/vendor/" | sed "s|^|  |"
+
+            # 1. sun_oplus_common.config - OnePlus 通用配置
+            if [ -f "${MSM_DEFCONFIG_DIR}/vendor/sun_oplus_common.config" ]; then
+              VENDOR_FRAGMENTS="${MSM_DEFCONFIG_DIR}/vendor/sun_oplus_common.config"
+              echo "📋 添加 vendor 配置: sun_oplus_common.config"
+            fi
+
+            # 2. sun_le.config - sun_le 基础配置
+            if [ -f "${MSM_DEFCONFIG_DIR}/vendor/sun_le.config" ]; then
+              VENDOR_FRAGMENTS="$VENDOR_FRAGMENTS ${MSM_DEFCONFIG_DIR}/vendor/sun_le.config"
+              echo "📋 添加 vendor 配置: sun_le.config"
+            fi
+
+            # 3. sun_consolidate.config - consolidate 配置
+            if [ -f "${MSM_DEFCONFIG_DIR}/vendor/sun_consolidate.config" ]; then
+              VENDOR_FRAGMENTS="$VENDOR_FRAGMENTS ${MSM_DEFCONFIG_DIR}/vendor/sun_consolidate.config"
+              echo "📋 添加 vendor 配置: sun_consolidate.config"
+            fi
+
+            # 4. 根据构建变体添加对应配置
+            case "$KERNEL_VARIANT" in
+              perf)
+                if [ -f "${MSM_DEFCONFIG_DIR}/vendor/sun_perf.config" ]; then
+                  VENDOR_FRAGMENTS="$VENDOR_FRAGMENTS ${MSM_DEFCONFIG_DIR}/vendor/sun_perf.config"
+                  echo "📋 添加 vendor perf 配置: sun_perf.config"
+                fi
+                ;;
+              debug)
+                if [ -f "${MSM_DEFCONFIG_DIR}/vendor/sun_le_debug.config" ]; then
+                  VENDOR_FRAGMENTS="$VENDOR_FRAGMENTS ${MSM_DEFCONFIG_DIR}/vendor/sun_le_debug.config"
+                  echo "📋 添加 vendor debug 配置: sun_le_debug.config"
+                fi
+                ;;
+            esac
+          else
+            echo "⚠️ msm-kernel 中无 vendor 配置目录"
+          fi
+
+          # 合并配置
+          DEFCONFIG_FRAGMENTS="$DEFCONFIG_FILE"
+          if [ -n "$VENDOR_FRAGMENTS" ]; then
+            DEFCONFIG_FRAGMENTS="$DEFCONFIG_FRAGMENTS $VENDOR_FRAGMENTS"
+          fi
+
+          echo "📋 合并配置: $DEFCONFIG_FRAGMENTS"
           mkdir -p out
           KCONFIG_CONFIG=out/.config ./scripts/kconfig/merge_config.sh -m -r -y $DEFCONFIG_FRAGMENTS
-          echo "✅ 配置合并完成，已生成 out/.config"
+          echo "✅ 配置合并完成"
 
-          # 验证配置并填充默认值
           echo "🔧 运行 olddefconfig 验证配置..."
           yes '' | make O=out ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE="$CROSS_COMPILE" olddefconfig
 
