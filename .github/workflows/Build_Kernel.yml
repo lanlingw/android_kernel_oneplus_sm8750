@@ -145,6 +145,21 @@ jobs:
             echo "⚠️ 使用系统 Clang"
           fi
 
+          # 查找 LLD (ld.lld)
+          LLD_BIN=$(find prebuilts/clang -name "ld.lld*" -type f 2>/dev/null | head -1)
+          if [ -n "$LLD_BIN" ]; then
+            LLD_DIR=$(dirname "$LLD_BIN")
+            echo "✅ 找到 LLD: $LLD_BIN"
+            # 创建 ld.lld 别名
+            if [ ! -f "$LLD_DIR/ld.lld" ] && [ -f "$LLD_DIR/ld.lld-18" ]; then
+              ln -sf "$LLD_DIR/ld.lld-18" "$LLD_DIR/ld.lld"
+            fi
+          else
+            echo "⚠️ 使用系统 LLD"
+            which ld.lld 2>/dev/null || echo "⚠️ ld.lld 未找到，将使用系统 ld"
+            LD_BIN=$(which ld.lld 2>/dev/null || which ld)
+          fi
+
           # 查找 GCC 交叉编译器
           GCC_BIN=$(find prebuilts/gcc -name "aarch64-linux-gnu-gcc" -type f 2>/dev/null | head -1)
           if [ -n "$GCC_BIN" ]; then
@@ -156,10 +171,11 @@ jobs:
             echo "⚠️ 使用系统 GCC"
           fi
 
-          export PATH="$CLANG_DIR:$GCC_DIR:/usr/lib/ccache:$PATH"
+          export PATH="$CLANG_DIR:${LLD_DIR:-/usr/bin}:$GCC_DIR:/usr/lib/ccache:$PATH"
 
           echo "📋 编译器版本:"
           clang --version | head -1
+          ld.lld --version 2>/dev/null || echo "⚠️ ld.lld 版本检查失败"
           ${CROSS_COMPILE}gcc --version 2>/dev/null | head -1 || echo "⚠️ 交叉编译器未找到"
 
           echo ""
