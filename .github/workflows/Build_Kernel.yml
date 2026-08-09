@@ -50,7 +50,7 @@ jobs:
             build-essential flex bison libssl-dev libncurses-dev zlib1g-dev \
             rsync unzip gawk dos2unix bc \
             libelf-dev pkg-config gcc-aarch64-linux-gnu clang lld llvm \
-            openjdk-17-jdk android-tools-fsutils
+            openjdk-17-jdk android-sdk-libsparse-utils
 
       - name: "📥 Install Repo Tool"
         run: |
