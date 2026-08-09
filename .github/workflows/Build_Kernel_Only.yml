@@ -4,14 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       CUSTOM_CONFIG:
-        description: "自定义内核配置选项 (每行一个，格式: CONFIG_XXX=y)"
+        description: "自定义内核配置选项 (逗号分隔，格式: CONFIG_XXX=y,CONFIG_YYY=y)"
         required: false
         type: string
-        default: |
-          CONFIG_SYSVIPC=y
-          CONFIG_POSIX_MQUEUE=y
-          CONFIG_IPC_NS=y
-          CONFIG_PID_NS=y
+        default: "CONFIG_SYSVIPC=y,CONFIG_POSIX_MQUEUE=y,CONFIG_IPC_NS=y,CONFIG_PID_NS=y"
 
 jobs:
   build:
@@ -115,9 +111,9 @@ jobs:
 
           echo ""
           echo "🔧 步骤2: 添加自定义内核配置..."
-          echo '${{ github.event.inputs.CUSTOM_CONFIG }}' >> out/.config
+          echo '${{ github.event.inputs.CUSTOM_CONFIG }}' | tr ',' '\n' | grep -v "^$" >> out/.config
           echo "📋 已追加的自定义配置:"
-          echo '${{ github.event.inputs.CUSTOM_CONFIG }}' | grep -v "^$" | grep -v "^#"
+          echo '${{ github.event.inputs.CUSTOM_CONFIG }}' | tr ',' '\n' | grep -v "^$"
           make -j$(nproc --all) \
             LLVM=1 \
             ARCH=arm64 \
@@ -158,13 +154,13 @@ jobs:
 
           echo ""
           echo "📋 检查自定义内核配置是否生效..."
-          while IFS= read -r line; do
-            [ -z "$line" ] && continue
-            [[ "$line" =~ ^# ]] && continue
-            cfg=$(echo "$line" | cut -d= -f1)
+          IFS=',' read -ra CFG_ARRAY <<< '${{ github.event.inputs.CUSTOM_CONFIG }}'
+          for item in "${CFG_ARRAY[@]}"; do
+            [ -z "$item" ] && continue
+            cfg=$(echo "$item" | cut -d= -f1)
             result=$(grep "^$cfg=" out/.config 2>/dev/null || grep "# $cfg is not set" out/.config 2>/dev/null || echo "NOT FOUND")
             echo "  $result"
-          done <<< '${{ github.event.inputs.CUSTOM_CONFIG }}'
+          done
 
           echo ""
           echo "📋 导出完整内核配置文件..."
