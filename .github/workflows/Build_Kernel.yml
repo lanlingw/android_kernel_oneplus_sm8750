@@ -60,7 +60,7 @@ jobs:
 
       - name: "📥 Init & Sync Repos"
         run: |
-          set -euo pipefail
+          set -eu
           mkdir -p kernel_workspace
           cd kernel_workspace
 
@@ -85,7 +85,7 @@ jobs:
 
       - name: "🔍 Check Build Inputs"
         run: |
-          set -euo pipefail
+          set -eu
           cd kernel_workspace/kernel_platform
 
           test -d common || { echo "common directory missing"; exit 1; }
@@ -98,7 +98,7 @@ jobs:
 
       - name: "🔎 Detect OnePlus Pad 2 Pro Device Tree"
         run: |
-          set -euo pipefail
+          set -eu
           cd kernel_workspace
 
           DTB_SEARCH_ROOT=kernel_platform
@@ -135,7 +135,7 @@ jobs:
 
       - name: "🔨 Build Kernel Image and Modules (DTBs optional)"
         run: |
-          set -euo pipefail
+          set -eu
           cd kernel_workspace/kernel_platform/common
 
           CLANG_BIN=$(find ../prebuilts/clang -type f -name clang | head -n 1 || true)
@@ -236,11 +236,15 @@ jobs:
 
           echo "📋 合并配置: $DEFCONFIG_FRAGMENTS"
           mkdir -p out
+          echo "---- [TRACE] merge_config.sh 开始 ----"
           KCONFIG_CONFIG=out/.config ./scripts/kconfig/merge_config.sh -m -r -y $DEFCONFIG_FRAGMENTS
+          echo "---- [TRACE] merge_config.sh 结束, exit=$? ----"
           echo "✅ 配置合并完成"
 
+          echo "---- [TRACE] 第一次 olddefconfig 开始 ----"
           echo "🔧 运行 olddefconfig 验证配置..."
           make O=out ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE="$CROSS_COMPILE" olddefconfig
+          echo "---- [TRACE] 第一次 olddefconfig 结束, exit=$? ----"
 
           if [ -n "${CUSTOM_CONFIG// }" ]; then
             echo "📋 应用自定义配置: $CUSTOM_CONFIG"
@@ -262,12 +266,20 @@ jobs:
               fi
             done
             echo "🔧 最终应用 olddefconfig..."
+            echo "---- [TRACE] 第二次 olddefconfig 开始 ----"
             make O=out ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE="$CROSS_COMPILE" olddefconfig
+            echo "---- [TRACE] 第二次 olddefconfig 结束, exit=$? ----"
           fi
 
           echo ""
           echo "🔧 开始编译 Image + Modules"
+          echo "---- [TRACE] 开始 make Image+modules ----"
+          set +e
           make -j"$(nproc --all)" O=out ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE="$CROSS_COMPILE" Image modules 2>&1 | tee ../build.log
+          MAKE_RC=${PIPESTATUS[0]}
+          set -e
+          echo "---- [TRACE] 结束 make Image+modules, MAKE_RC=$MAKE_RC ----"
+          if [ "$MAKE_RC" -ne 0 ]; then exit "$MAKE_RC"; fi
 
           if [ "${BUILD_DTBS:-false}" = "true" ]; then
             echo "🔧 仅编译已检测到的 OnePlus Pad 2 Pro DTB"
@@ -289,7 +301,7 @@ jobs:
       - name: "📦 Collect Build Artifacts"
         if: always()
         run: |
-          set -euo pipefail
+          set -eu
           cd kernel_workspace/kernel_platform 2>/dev/null || { mkdir -p kernel_workspace/kernel_platform/Final-Image; exit 0; }
 
           BUILD_MODE="${BUILD_MODE:-kernel-only}"
