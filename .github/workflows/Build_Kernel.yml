@@ -3,6 +3,15 @@ name: Build OnePlus Pad 2 Pro Kernel (Repo-based)
 on:
   workflow_dispatch:
     inputs:
+      BUILD_MODE:
+        description: "选择构建模式"
+        required: true
+        type: choice
+        default: "kernel-only"
+        options:
+          - "kernel-only"
+          - "gki"
+          - "both"
       CUSTOM_CONFIG:
         description: "自定义内核配置项（逗号分隔，例如 CONFIG_SYSVIPC=y,CONFIG_POSIX_MQUEUE=y）"
         required: false
@@ -18,6 +27,8 @@ jobs:
     env:
       CCACHE_MAXSIZE: 8G
       CUSTOM_CONFIG: ${{ github.event.inputs.CUSTOM_CONFIG }}
+      BUILD_MODE: ${{ github.event.inputs.BUILD_MODE }}
+      KERNEL_DEFCONFIG: sun_le_defconfig
 
     steps:
       - name: "🚀 Maximize Build Space"
@@ -38,7 +49,7 @@ jobs:
             build-essential flex bison libssl-dev libncurses-dev zlib1g-dev \
             rsync unzip gawk dos2unix bc \
             libelf-dev pkg-config gcc-aarch64-linux-gnu clang lld llvm \
-            openjdk-17-jdk
+            openjdk-17-jdk android-sdk-libsparse-utils
 
       - name: "📥 Install Repo Tool"
         run: |
@@ -60,17 +71,17 @@ jobs:
 
           repo sync -c -j"$(nproc --all)" --no-tags --no-clone-bundle --force-sync
 
-          echo "📂 workspace" 
+          echo "📂 workspace"
           ls -la
           echo ""
           echo "📂 kernel_platform"
           ls -la kernel_platform/
           echo ""
-          echo "📂 common" 
-          head -20 < <(ls -la kernel_platform/common/)
+          echo "📂 common"
+          ls -la kernel_platform/common/ | head -20 || true
           echo ""
           echo "📂 msm-kernel"
-          head -20 < <(ls -la kernel_platform/msm-kernel/)
+          ls -la kernel_platform/msm-kernel/ | head -20 || true
 
       - name: "🔍 Check Build Inputs"
         run: |
@@ -85,6 +96,28 @@ jobs:
           echo "✅ common tree ready"
           echo "✅ msm-kernel tree ready"
 
+      - name: "🔎 Detect OnePlus Pad 2 Pro Device Tree"
+        run: |
+          set -euo pipefail
+          cd kernel_workspace
+
+          DTB_SEARCH_ROOT=kernel_platform
+          echo "Searching for device tree sources under $DTB_SEARCH_ROOT..."
+          DTB_CANDIDATES=$(find "$DTB_SEARCH_ROOT" -type f -iname '*.dts' 2>/dev/null | grep -E -i '/arch/arm64/boot/dts/|/arch/arm64/boot/dts/.*' || true)
+
+          echo "$DTB_CANDIDATES" | grep -E -i '(oneplus|oplus|pad2|pad2pro|pad_2|sun_le|sm8750|sdm8750|pagani|erhai|dodge)' >/tmp/dtb_match.txt || true
+
+          if [ -s /tmp/dtb_match.txt ]; then
+            echo "Found candidate OnePlus Pad 2 Pro DTS sources:"
+            sort -u /tmp/dtb_match.txt | tee dtb_candidates_raw.txt
+            sed 's#^.*/##' dtb_candidates_raw.txt | grep -E -i '\.dts$' | sort -u > dtb_candidates.txt
+            cat dtb_candidates.txt
+            echo "BUILD_DTBS=true" >> "$GITHUB_ENV"
+          else
+            echo "No candidate OnePlus Pad 2 Pro DTS sources found in kernel tree; skipping dtbs build."
+            echo "BUILD_DTBS=false" >> "$GITHUB_ENV"
+          fi
+
       - name: "🔧 Setup ccache"
         run: |
           echo "CCACHE_DIR=$HOME/.ccache_pad2pro" >> "$GITHUB_ENV"
@@ -96,56 +129,22 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: ccache-pad2pro-${{ runner.os }}-${{ github.ref_name }}
+          key: ccache-pad2pro-${{ runner.os }}-${{ github.sha }}
           restore-keys: |
             ccache-pad2pro-${{ runner.os }}-
 
-      - name: "🔧 Apply Custom Kernel Config"
+      - name: "🔨 Build Kernel Image and Modules (DTBs optional)"
         run: |
           set -euo pipefail
           cd kernel_workspace/kernel_platform/common
 
-          echo "📋 解析自定义配置..."
-          IFS=',' read -ra CFG_ARRAY <<< "$CUSTOM_CONFIG"
-          for item in "${CFG_ARRAY[@]}"; do
-            item="${item//[$'\r\n']/}"
-            item="${item#${item%%[![:space:]]*}}"
-            item="${item%${item##*[![:space:]]}}"
-            if [ -z "$item" ]; then
-              continue
-            fi
-            if [[ "$item" =~ ^CONFIG_[A-Z0-9_]+=([ymn]|[0-9]+)$ ]]; then
-              echo "  -> $item"
-              ./scripts/config --file arch/arm64/configs/gki_defconfig --set-val "${item%%=*}" "${item#*=}"
-            else
-              echo "⚠️ 忽略非法配置项: $item"
-            fi
-          done
-
-          echo "📋 禁用常见 OPLUS 相关配置"
-          ./scripts/config --file arch/arm64/configs/gki_defconfig --disable CONFIG_OPLUS_BUG_STABILITY || true
-          ./scripts/config --file arch/arm64/configs/gki_defconfig --disable CONFIG_OPLUS_FEATURE_DEXOPT_STRATEGY || true
-          ./scripts/config --file arch/arm64/configs/gki_defconfig --disable CONFIG_OPLUS_FEATURE_THEIA || true
-          ./scripts/config --file arch/arm64/configs/gki_defconfig --disable CONFIG_OPLUS_BINDER_STRATEGY || true
-          ./scripts/config --file arch/arm64/configs/gki_defconfig --disable CONFIG_OPLUS_FEATURE_HEALTHINFO || true
-
-      - name: "🔨 Build Kernel Image + Modules"
-        run: |
-          set -euo pipefail
-          cd kernel_workspace/kernel_platform/common
-
-          echo "🔧 查找 Clang 工具链"
-          CLANG_BIN=$(find ../prebuilts/clang -type f -name clang 2>/dev/null | head -1 || true)
+          CLANG_BIN=$(find ../prebuilts/clang -type f -name clang | head -n 1 || true)
           if [ -n "$CLANG_BIN" ]; then
             CLANG_DIR=$(dirname "$CLANG_BIN")
+            export PATH="$CLANG_DIR:$PATH"
             echo "✅ 使用预编译 Clang: $CLANG_DIR"
           else
-            CLANG_DIR="/usr/bin"
-            echo "⚠️ 使用系统 Clang"
-          fi
-
-          if [ -d "$CLANG_DIR" ]; then
-            export PATH="$CLANG_DIR:$PATH"
+            echo "⚠️ 未找到预编译 Clang，使用系统 Clang"
           fi
 
           export KBUILD_BUILD_USER="OnePlus"
@@ -159,100 +158,241 @@ jobs:
           export CROSS_COMPILE="aarch64-linux-gnu-"
           export KCFLAGS="${KCFLAGS:-} -Wno-error"
 
-          echo "📋 编译器版本"
           clang --version | head -1
           ld.lld --version 2>/dev/null || true
           aarch64-linux-gnu-gcc --version | head -1 || true
 
           echo ""
-          echo "🔧 配置内核"
-          make O=out ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE="$CROSS_COMPILE" gki_defconfig
+          echo "BUILD_MODE=${BUILD_MODE}"
+          echo "🔧 使用目标配置: $KERNEL_DEFCONFIG"
+          make O=out ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE="$CROSS_COMPILE" "$KERNEL_DEFCONFIG"
+
+          if [ -n "${CUSTOM_CONFIG// }" ]; then
+            echo "📋 应用自定义配置: $CUSTOM_CONFIG"
+            IFS=',' read -ra CFG_ITEMS <<< "$CUSTOM_CONFIG"
+            for item in "${CFG_ITEMS[@]}"; do
+              item="${item//[$'\r\n']/}"
+              item="${item#${item%%[![:space:]]*}}"
+              item="${item%${item##*[![:space:]]}}"
+              if [ -z "$item" ]; then
+                continue
+              fi
+              if [[ "$item" =~ ^CONFIG_[A-Z0-9_]+=([ymn]|[0-9]+)$ ]]; then
+                name="${item%%=*}"
+                value="${item#*=}"
+                echo "  -> $name=$value"
+                ./scripts/config --file out/.config --set-val "$name" "$value"
+              else
+                echo "⚠️ 忽略非法配置项: $item"
+              fi
+            done
+            yes '' | make O=out ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE="$CROSS_COMPILE" olddefconfig
+          fi
 
           echo ""
-          echo "🔧 编译 Image + Modules"
+          echo "🔧 开始编译 Image + Modules"
           make -j"$(nproc --all)" O=out ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE="$CROSS_COMPILE" Image modules 2>&1 | tee ../build.log
 
-      - name: "🔧 Build DTB"
-        run: |
-          set -euo pipefail
-          cd kernel_workspace/kernel_platform/common
-
-          echo "🔧 编译设备树"
-          make -j"$(nproc --all)" O=out ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE="aarch64-linux-gnu-" dtbs 2>&1 | tee -a ../build.log
+          if [ "${BUILD_DTBS:-false}" = "true" ]; then
+            echo "🔧 仅编译已检测到的 OnePlus Pad 2 Pro DTB"
+            if [ -f ../../dtb_candidates.txt ]; then
+              DTB_TARGETS=$(sed 's/\.dts$/.dtb/I' ../../dtb_candidates.txt | sort -u)
+              for DTB_TARGET in $DTB_TARGETS; do
+                echo "-> building $DTB_TARGET"
+                if ! make -j"$(nproc --all)" O=out ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE="$CROSS_COMPILE" "$DTB_TARGET"; then
+                  echo "⚠️ $DTB_TARGET 构建失败，继续下一个 DTB"
+                fi
+              done
+            else
+              echo "⚠️ 未找到 dtb_candidates.txt，无法按设备选择 DTB。"
+            fi
+          else
+            echo "🔧 DTBs 构建已跳过，因为未检测到 OnePlus Pad 2 Pro 设备树源。"
+          fi
 
       - name: "📦 Collect Build Artifacts"
+        if: always()
         run: |
           set -euo pipefail
-          cd kernel_workspace/kernel_platform
+          cd kernel_workspace/kernel_platform 2>/dev/null || { mkdir -p kernel_workspace/kernel_platform/Final-Image; exit 0; }
 
-          mkdir -p Final-Image/dts Final-Image/modules
+          BUILD_MODE="${BUILD_MODE:-kernel-only}"
+          COPY_KERNEL_ARTIFACTS=false
+          COPY_GKI_ARTIFACTS=false
+          case "$BUILD_MODE" in
+            kernel-only)
+              COPY_KERNEL_ARTIFACTS=true
+              ;;
+            gki)
+              COPY_GKI_ARTIFACTS=true
+              ;;
+            both)
+              COPY_KERNEL_ARTIFACTS=true
+              COPY_GKI_ARTIFACTS=true
+              ;;
+            *)
+              echo "Unknown BUILD_MODE=$BUILD_MODE; defaulting to both output layouts."
+              COPY_KERNEL_ARTIFACTS=true
+              COPY_GKI_ARTIFACTS=true
+              ;;
+          esac
+
+          mkdir -p Final-Image/logs
+          if [ "$COPY_KERNEL_ARTIFACTS" = true ]; then
+            mkdir -p Final-Image/{boot,kernel,dtbs,modules,bootconfig}
+          fi
+          if [ "$COPY_GKI_ARTIFACTS" = true ]; then
+            mkdir -p Final-Image/gki/{boot,dtbs,modules,system_dlkm,vendor_dlkm,bootconfig,logs,vendor_boot}
+          fi
 
           if [ -f common/out/arch/arm64/boot/Image ]; then
-            cp common/out/arch/arm64/boot/Image Final-Image/Image
-            echo "✅ Image copied"
-          fi
-
-          if [ -f common/out/arch/arm64/boot/Image.gz ]; then
-            cp common/out/arch/arm64/boot/Image.gz Final-Image/Image.gz
-          fi
-
-          if [ -f common/out/arch/arm64/boot/Image.lz4 ]; then
-            cp common/out/arch/arm64/boot/Image.lz4 Final-Image/Image.lz4
-          fi
-
-          if [ -d common/out/arch/arm64/boot/dts ]; then
-            find common/out/arch/arm64/boot/dts -name '*.dtb' -exec cp {} Final-Image/dts/ \; 2>/dev/null
-            find common/out/arch/arm64/boot/dts -name '*.dtbo' -exec cp {} Final-Image/dts/ \; 2>/dev/null
-          fi
-
-          if [ -d common/out ]; then
-            find common/out -name '*.ko' -type f -exec cp {} Final-Image/modules/ \; 2>/dev/null
+            if [ "$COPY_KERNEL_ARTIFACTS" = true ]; then
+              cp common/out/arch/arm64/boot/Image Final-Image/kernel/Image
+            fi
+            if [ "$COPY_GKI_ARTIFACTS" = true ]; then
+              cp common/out/arch/arm64/boot/Image Final-Image/gki/boot/Image
+            fi
           fi
 
           if [ -f common/out/.config ]; then
-            cp common/out/.config Final-Image/kernel.config
+            if [ "$COPY_KERNEL_ARTIFACTS" = true ]; then
+              cp common/out/.config Final-Image/kernel/kernel.config
+            fi
+            if [ "$COPY_GKI_ARTIFACTS" = true ]; then
+              cp common/out/.config Final-Image/gki/boot/kernel.config
+            fi
           fi
 
           if [ -f common/out/vmlinux ]; then
             cp common/out/vmlinux Final-Image/vmlinux
           fi
 
-          echo "📦 Final artifacts"
-          find Final-Image -maxdepth 2 -type f | sort | sed 's#^# - #' || true
-
-      - name: "🧱 Build boot.img (best effort)"
-        run: |
-          set -euo pipefail
-          cd kernel_workspace/kernel_platform
-
-          if [ -f Final-Image/Image ]; then
-            DTB_FILE=$(find Final-Image/dts -type f -name '*.dtb' 2>/dev/null | head -1 || true)
-            MKBOOTIMG_PY=$(find . -path '*/mkbootimg.py' 2>/dev/null | head -1 || true)
-            if [ -n "$MKBOOTIMG_PY" ]; then
-              mkdir -p Final-Image/boot
-              python3 "$MKBOOTIMG_PY" \
-                --kernel Final-Image/Image \
-                --ramdisk /dev/null \
-                --output Final-Image/boot.img \
-                --pagesize 4096 \
-                --dtb "$DTB_FILE" \
-                --header_version 4 \
-                --os_version 15 \
-                --os_patch_level 2026-08-09 \
-                --cmdline 'console=ttyMSM0,115200n8 earlycon' || true
-            else
-              echo "⚠️ mkbootimg.py not found; skipping boot.img"
+          if [ -f common/out/bootconfig ]; then
+            if [ "$COPY_KERNEL_ARTIFACTS" = true ]; then
+              cp common/out/bootconfig Final-Image/bootconfig/bootconfig
+            fi
+            if [ "$COPY_GKI_ARTIFACTS" = true ]; then
+              cp common/out/bootconfig Final-Image/gki/bootconfig/bootconfig
             fi
           else
-            echo "⚠️ Image not found; skipping boot.img"
+            if [ "$COPY_KERNEL_ARTIFACTS" = true ]; then
+              echo "bootconfig not generated by kernel build" > Final-Image/bootconfig/README.txt
+            fi
+            if [ "$COPY_GKI_ARTIFACTS" = true ]; then
+              echo "bootconfig not generated by kernel build" > Final-Image/gki/bootconfig/README.txt
+            fi
           fi
 
+          if [ "${BUILD_DTBS:-false}" = "true" ] && [ -d common/out/arch/arm64/boot/dts ]; then
+            echo "Collecting built dtb artifacts for OnePlus Pad 2 Pro"
+            if [ -f ../dtb_candidates.txt ]; then
+              while IFS= read -r dts_file; do
+                dtb_name=$(basename "$dts_file" .dts).dtb
+                if [ -f common/out/arch/arm64/boot/dts/$dtb_name ]; then
+                  if [ "$COPY_KERNEL_ARTIFACTS" = true ]; then
+                    cp common/out/arch/arm64/boot/dts/$dtb_name Final-Image/dtbs/
+                  fi
+                  if [ "$COPY_GKI_ARTIFACTS" = true ]; then
+                    cp common/out/arch/arm64/boot/dts/$dtb_name Final-Image/gki/dtbs/
+                  fi
+                else
+                  echo "⚠️ 未找到构建后的 DTB: $dtb_name"
+                fi
+              done < ../dtb_candidates.txt
+            fi
+            if [ "$COPY_KERNEL_ARTIFACTS" = true ] || [ "$COPY_GKI_ARTIFACTS" = true ]; then
+              find common/out/arch/arm64/boot/dts -name '*.dtbo' -print0 | xargs -0 -I{} bash -c '
+                [ "$COPY_KERNEL_ARTIFACTS" = true ] && cp "$1" Final-Image/dtbs/ || true
+                [ "$COPY_GKI_ARTIFACTS" = true ] && cp "$1" Final-Image/gki/dtbs/ || true
+              ' bash {} 2>/dev/null || true
+            fi
+          else
+            echo "No device tree artifacts collected; dtb build was skipped or no target DTBs found."
+          fi
+
+          if [ -d common/out ]; then
+            if [ "$COPY_KERNEL_ARTIFACTS" = true ]; then
+              find common/out -name '*.ko' -type f -exec cp {} Final-Image/modules/ \; 2>/dev/null || true
+            fi
+            if [ "$COPY_GKI_ARTIFACTS" = true ]; then
+              find common/out -name '*.ko' -type f -exec cp {} Final-Image/gki/modules/ \; 2>/dev/null || true
+            fi
+          fi
+
+          if [ "$COPY_GKI_ARTIFACTS" = true ]; then
+            if [ -d common/out/system_dlkm ]; then
+              cp -r common/out/system_dlkm Final-Image/gki/system_dlkm
+            else
+              echo "system_dlkm not generated by kernel build" > Final-Image/gki/system_dlkm/README.txt
+            fi
+
+            if [ -d common/out/vendor_dlkm ]; then
+              cp -r common/out/vendor_dlkm Final-Image/gki/vendor_dlkm
+            else
+              echo "vendor_dlkm not generated by kernel build" > Final-Image/gki/vendor_dlkm/README.txt
+            fi
+          fi
+
+          if [ -d common/out/arch/arm64/boot/dts ]; then
+            DTB_FILE=$(find common/out/arch/arm64/boot/dts -name '*.dtb' | head -n 1 || true)
+          fi
+
+          if command -v mkbootimg >/dev/null && [ -n "${DTB_FILE:-}" ] && [ -f common/out/arch/arm64/boot/Image ]; then
+            mkdir -p Final-Image/boot
+            touch Final-Image/boot/empty_ramdisk.img
+            mkbootimg --kernel common/out/arch/arm64/boot/Image \
+              --ramdisk Final-Image/boot/empty_ramdisk.img \
+              --output Final-Image/boot/boot.img \
+              --pagesize 4096 \
+              --base 0x10000000 \
+              --dtb "$DTB_FILE" \
+              --header_version 4 \
+              --os_version 16 \
+              --os_patch_level 2026-08-09 \
+              --cmdline 'console=ttyMSM0,115200n8 earlycon'
+            if [ "$COPY_GKI_ARTIFACTS" = true ]; then
+              mkdir -p Final-Image/gki/boot
+              cp Final-Image/boot/boot.img Final-Image/gki/boot/boot.img
+            fi
+          else
+            mkdir -p Final-Image/logs
+            echo "mkbootimg missing or Image/DTB unavailable; skipping boot.img generation" > Final-Image/logs/bootimg_status.txt
+            if [ "$COPY_GKI_ARTIFACTS" = true ]; then
+              mkdir -p Final-Image/gki/logs
+              echo "mkbootimg missing or Image/DTB unavailable; skipping boot.img generation" > Final-Image/gki/logs/bootimg_status.txt
+            fi
+          fi
+
+          if [ "$COPY_GKI_ARTIFACTS" = true ]; then
+            mkdir -p Final-Image/gki/vendor_boot
+            echo "vendor_boot partition image is not created by this workflow" > Final-Image/gki/vendor_boot/README.txt
+          fi
+
+          if [ -f build.log ]; then
+            cp build.log Final-Image/logs/build.log
+            if [ "$COPY_GKI_ARTIFACTS" = true ]; then
+              mkdir -p Final-Image/gki/logs
+              cp build.log Final-Image/gki/logs/build.log
+            fi
+          fi
+
+          echo "📦 Artifact layout"
+          find Final-Image -maxdepth 4 -type f | sort | sed 's#^# - #' || true
+
       - name: "📤 Upload Kernel Artifacts"
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: kernel_pad2pro_repo_build
-          path: kernel_workspace/kernel_platform/Final-Image/
+          path: |
+            kernel_workspace/kernel_platform/Final-Image
           retention-days: 7
+
+      - name: "📝 Ensure Build Log Exists"
+        if: always()
+        run: |
+          mkdir -p kernel_workspace/kernel_platform
+          touch kernel_workspace/kernel_platform/build.log
 
       - name: "📤 Upload Build Log"
         if: always()
