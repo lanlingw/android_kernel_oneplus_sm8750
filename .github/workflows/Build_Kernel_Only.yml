@@ -107,7 +107,9 @@ jobs:
             CC="ccache clang" \
             LD=ld.lld \
             O=out \
-            2>&1 | tee build.log | tail -30
+            2>&1 | tee build.log
+
+          BUILD_EXIT=${PIPESTATUS[0]}
 
           echo ""
           ccache -s
@@ -115,10 +117,15 @@ jobs:
 
           if [ -f "out/arch/arm64/boot/Image" ]; then
             echo "✅ 编译成功!"
-            echo "📦 Image 大小: $(du -h out/arch64/boot/Image | cut -f1)"
+            echo "📦 Image 大小: $(du -h out/arch/arm64/boot/Image | cut -f1)"
             echo "📦 Image.gz 大小: $(du -h out/arch/arm64/boot/Image.gz 2>/dev/null | cut -f1 || echo 'N/A')"
           else
-            echo "❌ 编译失败"
+            echo "❌ 编译失败 (exit code: $BUILD_EXIT)"
+            echo "=== 错误信息 ==="
+            grep -E "(Error|error:|FAILED|fatal)" build.log | tail -30
+            echo ""
+            echo "=== 最后 30 行日志 ==="
+            tail -30 build.log
             exit 1
           fi
 
