@@ -29,8 +29,26 @@ jobs:
       - name: "📦 Cache & Install Dependencies"
         uses: awalsh128/cache-apt-pkgs-action@latest
         with:
-          packages: python3 git curl ccache libelf-dev build-essential flex bison libssl-dev libncurses-dev liblz4-tool zlib1g-dev libxml2-utils rsync unzip gawk dos2unix bc clang lld
+          packages: python3 git curl ccache libelf-dev build-essential flex bison libssl-dev libncurses-dev liblz4-tool zlib1g-dev libxml2-utils rsync unzip gawk dos2unix bc clang lld llvm
           execute_install_scripts: true
+
+      - name: "🔧 Install newer LLVM/Clang"
+        run: |
+          echo "📋 检查可用 LLVM 版本..."
+          apt-cache search llvm | grep -E "llvm-[0-9]+" | sort
+          echo "📋 检查可用 Clang 版本..."
+          apt-cache search clang | grep -E "clang-[0-9]+" | sort
+
+          echo "🔧 安装 LLVM 15/18..."
+          sudo apt-get install -y llvm-15 llvm-15-dev clang-15 lld-15 2>/dev/null || \
+          sudo apt-get install -y llvm-18 llvm-18-dev clang-18 lld-18 2>/dev/null || \
+          echo "⚠️ 无法安装预编译 LLVM，使用系统默认"
+
+          echo "📋 当前编译器版本:"
+          clang --version | head -1
+          ld.lld --version | head -1
+          which llvm-objcopy 2>/dev/null || echo "llvm-objcopy 未找到"
+          which llvm-strip 2>/dev/null || echo "llvm-strip 未找到"
 
       - name: "📥 Clone GKI Kernel Source"
         run: |
