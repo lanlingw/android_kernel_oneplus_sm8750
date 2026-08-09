@@ -240,7 +240,7 @@ jobs:
           echo "✅ 配置合并完成"
 
           echo "🔧 运行 olddefconfig 验证配置..."
-          yes '' | make O=out ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE="$CROSS_COMPILE" olddefconfig
+          make O=out ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE="$CROSS_COMPILE" olddefconfig
 
           if [ -n "${CUSTOM_CONFIG// }" ]; then
             echo "📋 应用自定义配置: $CUSTOM_CONFIG"
@@ -261,7 +261,8 @@ jobs:
                 echo "⚠️ 忽略非法配置项: $item"
               fi
             done
-            yes '' | make O=out ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE="$CROSS_COMPILE" olddefconfig
+            echo "🔧 最终应用 olddefconfig..."
+            make O=out ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE="$CROSS_COMPILE" olddefconfig
           fi
 
           echo ""
