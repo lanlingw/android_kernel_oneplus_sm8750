@@ -2,6 +2,16 @@ name: Build OnePlus Pad 2 Pro GKI Kernel (Official)
 
 on:
   workflow_dispatch:
+    inputs:
+      CUSTOM_CONFIG:
+        description: "自定义内核配置选项 (每行一个，格式: CONFIG_XXX=y)"
+        required: false
+        type: string
+        default: |
+          CONFIG_SYSVIPC=y
+          CONFIG_POSIX_MQUEUE=y
+          CONFIG_IPC_NS=y
+          CONFIG_PID_NS=y
 
 jobs:
   build:
@@ -105,10 +115,9 @@ jobs:
 
           echo ""
           echo "🔧 步骤2: 添加自定义内核配置..."
-          echo "CONFIG_SYSVIPC=y" >> out/.config
-          echo "CONFIG_POSIX_MQUEUE=y" >> out/.config
-          echo "CONFIG_IPC_NS=y" >> out/.config
-          echo "CONFIG_PID_NS=y" >> out/.config
+          echo '${{ github.event.inputs.CUSTOM_CONFIG }}' >> out/.config
+          echo "📋 已追加的自定义配置:"
+          echo '${{ github.event.inputs.CUSTOM_CONFIG }}' | grep -v "^$" | grep -v "^#"
           make -j$(nproc --all) \
             LLVM=1 \
             ARCH=arm64 \
@@ -147,6 +156,21 @@ jobs:
             exit 1
           fi
 
+          echo ""
+          echo "📋 检查自定义内核配置是否生效..."
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            [[ "$line" =~ ^# ]] && continue
+            cfg=$(echo "$line" | cut -d= -f1)
+            result=$(grep "^$cfg=" out/.config 2>/dev/null || grep "# $cfg is not set" out/.config 2>/dev/null || echo "NOT FOUND")
+            echo "  $result"
+          done <<< '${{ github.event.inputs.CUSTOM_CONFIG }}'
+
+          echo ""
+          echo "📋 导出完整内核配置文件..."
+          cp out/.config Final-Image/kernel.config
+          echo "✅ 配置文件已保存"
+
       - name: "📦 Collect Kernel Images"
         run: |
           cd kernel
@@ -172,10 +196,10 @@ jobs:
           echo "📦 最终产物:"
           ls -lh Final-Image/
 
-      - name: "📤 Upload Kernel Image"
+      - name: "📤 Upload Kernel Artifacts"
         uses: actions/upload-artifact@v7
         with:
-          name: Image_oneplus_pad_2_pro_gki_official
+          name: kernel_pad2pro_official
           path: kernel/Final-Image/*
           retention-days: 7
 
