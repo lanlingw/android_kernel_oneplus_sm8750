@@ -1,4 +1,4 @@
-name: OnePlus Pad 2 Pro (Official - Bazel)
+name: Build OnePlus Pad 2 Pro Kernel (Official - Bazel)
 
 on:
   workflow_dispatch:
@@ -127,7 +127,7 @@ jobs:
           echo "📋 检查 gki_defconfig 末尾:"
           tail -10 msm-kernel/arch/arm64/configs/gki_defconfig
 
-      - name: "🔨 Build Kernel via Bazel/Kleaf"
+      - name: "🔨 Build Kernel + Modules (Skip OPLUS)"
         run: |
           cd kernel_workspace/kernel_platform
 
@@ -135,117 +135,159 @@ jobs:
           export KBUILD_BUILD_USER="OnePlus"
           export KBUILD_BUILD_HOST="GitHub-Actions"
 
-          echo "🔧 检查构建系统..."
-          if [ -f "build/build.sh" ]; then
-            echo "✅ 使用 build/build.sh (Kleaf)"
-            BUILD_CMD="build/build.sh"
-          elif [ -f "msm-kernel/build_with_bazel.py" ]; then
-            echo "✅ 使用 build_with_bazel.py"
-            BUILD_CMD="python3 msm-kernel/build_with_bazel.py"
+          # 查找 Clang
+          CLANG_BIN=$(find prebuilts/clang -name "clang" -type f 2>/dev/null | head -1)
+          if [ -n "$CLANG_BIN" ]; then
+            CLANG_DIR=$(dirname "$CLANG_BIN")
+            echo "✅ 使用预编译 Clang: $CLANG_DIR"
           else
-            echo "❌ 找不到构建系统"
-            ls build/ 2>/dev/null
-            exit 1
+            CLANG_DIR="/usr/bin"
+            echo "⚠️ 使用系统 Clang"
           fi
+
+          # 查找 GCC 交叉编译器
+          GCC_BIN=$(find prebuilts/gcc -name "aarch64-linux-gnu-gcc" -type f 2>/dev/null | head -1)
+          if [ -n "$GCC_BIN" ]; then
+            GCC_DIR=$(dirname "$GCC_BIN")
+            export CROSS_COMPILE="$(pwd)/$GCC_DIR/aarch64-linux-gnu-"
+            echo "✅ 使用预编译 GCC: $CROSS_COMPILE"
+          else
+            export CROSS_COMPILE="aarch64-linux-gnu-"
+            echo "⚠️ 使用系统 GCC"
+          fi
+
+          export PATH="$CLANG_DIR:$GCC_DIR:/usr/lib/ccache:$PATH"
+
+          echo "📋 编译器版本:"
+          clang --version | head -1
+          ${CROSS_COMPILE}gcc --version 2>/dev/null | head -1 || echo "⚠️ 交叉编译器未找到"
 
           echo ""
-          echo "🔧 开始构建内核..."
-          echo "📋 目标: sun (sm8750) gki"
+          echo "🔧 步骤1: 配置 common 内核..."
+          cd common
 
-          if [ "$BUILD_CMD" = "build/build.sh" ]; then
-            # 使用 build.sh (Kleaf)
-            BUILD_BOOT_IMG=1 \
-            BUILD_INITRAMFS=1 \
-            BUILD_VENDOR_DLKM=1 \
-            LTO=thin \
-            build/build.sh \
-              --dist_dir=dist \
-              --target=msm.sun \
-              --variant=gki \
-              2>&1 | tee build.log
-          else
-            # 使用 build_with_bazel.py
-            python3 msm-kernel/build_with_bazel.py \
-              -t sun gki \
-              2>&1 | tee build.log
-          fi
+          # 添加自定义配置到 defconfig
+          CUSTOM_CFG='${{ github.event.inputs.CUSTOM_CONFIG }}'
+          echo "$CUSTOM_CFG" | tr ',' '\n' | grep -v '^$' >> arch/arm64/configs/gki_defconfig
+
+          # 禁用 OPLUS 闭源驱动 (避免编译问题)
+          ./scripts/config --file arch/arm64/configs/gki_defconfig \
+            --disable CONFIG_OPLUS_BUG_STABILITY \
+            --disable CONFIG_OPLUS_FEATURE_DEXOPT_STRATEGY \
+            --disable CONFIG_OPLUS_FEATURE_THEIA \
+            --disable CONFIG_OPLUS_BINDER_STRATEGY \
+            --disable CONFIG_OPLUS_FEATURE_HEALTHINFO || true
+
+          echo ""
+          echo "🔧 步骤2: 编译 common 内核镜像 + 模块..."
+          make -j$(nproc --all) \
+            LLVM=1 \
+            ARCH=arm64 \
+            CC="ccache clang" \
+            LD=ld.lld \
+            CROSS_COMPILE=${CROSS_COMPILE} \
+            O=out \
+            gki_defconfig all 2>&1 | tee ../build_common.log
 
           BUILD_EXIT=${PIPESTATUS[0]}
 
           echo ""
           if [ $BUILD_EXIT -ne 0 ]; then
-            echo "❌ 构建失败"
+            echo "❌ common 内核编译失败"
             echo "=== 错误信息 ==="
-            grep -E "(Error|error:|FAILED|fatal)" build.log | tail -30
-            echo ""
-            echo "=== 最后 50 行 ==="
-            tail -50 build.log
+            grep -E "(Error|error:|FAILED|fatal)" ../build_common.log | tail -20
             exit 1
           fi
+
+          if [ -f "out/arch/arm64/boot/Image" ]; then
+            echo "✅ common 内核编译成功!"
+            echo "📦 Image 大小: $(du -h out/arch/arm64/boot/Image | cut -f1)"
+          fi
+
+          echo ""
+          echo "🔧 步骤3: 编译设备树 (DTB)..."
+          cd ../msm-kernel
+
+          # 配置 msm-kernel defconfig
+          echo "$CUSTOM_CFG" | tr ',' '\n' | grep -v '^$' >> arch/arm64/configs/vendor/sun-gki.config 2>/dev/null || \
+          echo "$CUSTOM_CFG" | tr ',' '\n' | grep -v '^$' >> arch/arm64/configs/gki_defconfig 2>/dev/null || true
+
+          # 尝试编译设备树
+          make -j$(nproc --all) \
+            LLVM=1 \
+            ARCH=arm64 \
+            CC="ccache clang" \
+            LD=ld.lld \
+            CROSS_COMPILE=${CROSS_COMPILE} \
+            O=out \
+            dtbs 2>&1 | tee ../build_dtb.log || echo "⚠️ DTB 编译失败，可能需要 vendor 配置"
+
+          echo ""
+          echo "🔧 步骤4: 编译 msm-kernel 设备驱动模块..."
+          make -j$(nproc --all) \
+            LLVM=1 \
+            ARCH=arm64 \
+            CC="ccache clang" \
+            LD=ld.lld \
+            CROSS_COMPILE=${CROSS_COMPILE} \
+            O=out \
+            KBUILD_MIXED_TREE=../common \
+            modules 2>&1 | tee ../build_modules.log || echo "⚠️ 模块编译失败"
+
+          echo ""
+          ccache -s
 
       - name: "📦 Collect Build Artifacts"
         run: |
           cd kernel_workspace/kernel_platform
 
-          echo "📋 搜索构建产物..."
+          echo "📋 收集构建产物..."
           echo ""
 
-          echo "--- 搜索 Image ---"
-          find . -name "Image" -path "*/boot/*" -type f 2>/dev/null
-          find dist -name "Image*" -type f 2>/dev/null
-
-          echo ""
-          echo "--- 搜索 DTB ---"
-          find . -name "*.dtb" -type f 2>/dev/null | head -20
-
-          echo ""
-          echo "--- 搜索 .ko ---"
-          find . -name "*.ko" -type f 2>/dev/null | wc -l
-
-          echo ""
-          echo "--- dist 目录 ---"
-          ls -la dist/ 2>/dev/null || echo "dist 目录不存在"
-
-          echo ""
           mkdir -p Final-Image
 
-          # 复制 Image
-          for img in $(find . -name "Image" -path "*/boot/*" -type f 2>/dev/null | head -1); do
-            cp "$img" Final-Image/Image
-            echo "✅ Image 已复制: $img"
-          done
-
-          # 从 dist 复制
-          if [ -d "dist" ]; then
-            cp dist/Image* Final-Image/ 2>/dev/null || true
-            cp dist/*.ko Final-Image/ 2>/dev/null || true
-            cp dist/*.dtb* Final-Image/ 2>/dev/null || true
-            cp dist/*.dtbo* Final-Image/ 2>/dev/null || true
+          # 复制 Image (从 common)
+          if [ -f "common/out/arch/arm64/boot/Image" ]; then
+            cp common/out/arch/arm64/boot/Image Final-Image/Image
+            echo "✅ Image 已复制 ($(du -h common/out/arch/arm64/boot/Image | cut -f1))"
           fi
 
-          # 复制 DTB
-          if [ -d "dist/arch/arm64/boot/dts" ]; then
+          if [ -f "common/out/arch/arm64/boot/Image.gz" ]; then
+            cp common/out/arch/arm64/boot/Image.gz Final-Image/Image.gz
+            echo "✅ Image.gz 已复制 ($(du -h common/out/arch/arm64/boot/Image.gz | cut -f1))"
+          fi
+
+          if [ -f "common/out/arch/arm64/boot/Image.lz4" ]; then
+            cp common/out/arch/arm64/boot/Image.lz4 Final-Image/Image.lz4
+            echo "✅ Image.lz4 已复制 ($(du -h common/out/arch/arm64/boot/Image.lz4 | cut -f1))"
+          fi
+
+          # 复制 DTB (从 msm-kernel)
+          if [ -d "msm-kernel/out/arch/arm64/boot/dts" ]; then
             mkdir -p Final-Image/dts
-            find dist/arch/arm64/boot/dts -name "*.dtb" -exec cp {} Final-Image/dts/ \; 2>/dev/null
-            find dist/arch/arm64/boot/dts -name "*.dtbo" -exec cp {} Final-Image/dts/ \; 2>/dev/null
+            find msm-kernel/out/arch/arm64/boot/dts -name "*.dtb" -exec cp {} Final-Image/dts/ \; 2>/dev/null
+            find msm-kernel/out/arch/arm64/boot/dts -name "*.dtbo" -exec cp {} Final-Image/dts/ \; 2>/dev/null
+            DTB_COUNT=$(find Final-Image/dts -type f 2>/dev/null | wc -l)
+            echo "✅ DTB/DTBO 已复制 ($DTB_COUNT 个文件)"
           fi
 
-          # 复制模块
-          KO_COUNT=$(find . -name "*.ko" -type f 2>/dev/null | wc -l)
+          # 复制内核模块 (.ko)
+          echo ""
+          echo "📦 收集内核模块..."
+          KO_COUNT=$(find common/out msm-kernel/out -name "*.ko" -type f 2>/dev/null | wc -l)
           if [ "$KO_COUNT" -gt 0 ]; then
             mkdir -p Final-Image/modules
-            find . -name "*.ko" -exec cp --parents {} Final-Image/modules/ \; 2>/dev/null
+            find common/out msm-kernel/out -name "*.ko" -exec cp {} Final-Image/modules/ \; 2>/dev/null
             echo "✅ 已复制 $KO_COUNT 个 .ko 文件"
+          else
+            echo "⚠️ 未找到 .ko 文件"
           fi
 
           # 复制配置文件
-          for cfg in msm-kernel/out/.config common/out/.config; do
-            if [ -f "$cfg" ]; then
-              cp "$cfg" Final-Image/kernel.config
-              echo "✅ kernel.config 已复制"
-              break
-            fi
-          done
+          if [ -f "common/out/.config" ]; then
+            cp common/out/.config Final-Image/kernel.config
+            echo "✅ kernel.config 已复制"
+          fi
 
           echo ""
           echo "📦 最终产物:"
