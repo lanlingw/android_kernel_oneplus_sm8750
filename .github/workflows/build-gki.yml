@@ -465,109 +465,20 @@ jobs:
 
             # 修复 walt_halt.c 中未保护的 OnePlus 符号引用
             # OnePlus 源码不完整，kernel/oplus_cpu/ 目录未开源
-            # 需要用 #ifdef CONFIG_OPLUS_ADD_CORE_CTRL_MASK 保护这些符号的使用
+            # 用 sed 直接修改，避免 heredoc 在 YAML 中的问题
             WALT_HALT_FILE="msm-kernel/kernel/sched/walt/walt_halt.c"
             if [ -f "$WALT_HALT_FILE" ]; then
               echo "=== 修复 walt_halt.c 中未保护的 OnePlus 符号引用 ==="
               
-              # 创建 Python 脚本来修复文件
-              cat > /tmp/fix_walt_halt.py << 'PYEOF'
-import re
-
-file_path = "msm-kernel/kernel/sched/walt/walt_halt.c"
-
-with open(file_path, "r") as f:
-    content = f.read()
-
-old_update_clients = '''static void update_clients(struct cpumask *cpus, bool halt, enum pause_client client,
-			   enum pause_type type)
-{
-	int cpu;
-	struct halt_cpu_state *halt_cpu_state;
-	int *pause_client_state;
-	for_each_cpu(cpu, cpus) {
-		halt_cpu_state = per_cpu_ptr(&halt_state, cpu);
-		pause_client_state = per_cpu_ptr(oplus_cur_pause_client, cpu);
-		if (halt) {
-			pause_client_state[type] |= client;
-			halt_cpu_state->client_vote_mask[type] |=  client;
-		}else {
-			pause_client_state[type] &= ~client;
-			halt_cpu_state->client_vote_mask[type] &= ~client;
-		}
-	}
-}'''
-
-new_update_clients = '''static void update_clients(struct cpumask *cpus, bool halt, enum pause_client client,
-			   enum pause_type type)
-{
-	int cpu;
-	struct halt_cpu_state *halt_cpu_state;
-#ifdef CONFIG_OPLUS_ADD_CORE_CTRL_MASK
-	int *pause_client_state;
-#endif
-	for_each_cpu(cpu, cpus) {
-		halt_cpu_state = per_cpu_ptr(&halt_state, cpu);
-#ifdef CONFIG_OPLUS_ADD_CORE_CTRL_MASK
-		pause_client_state = per_cpu_ptr(oplus_cur_pause_client, cpu);
-		if (halt) {
-			pause_client_state[type] |= client;
-			halt_cpu_state->client_vote_mask[type] |=  client;
-		}else {
-			pause_client_state[type] &= ~client;
-			halt_cpu_state->client_vote_mask[type] &= ~client;
-		}
-#endif
-	}
-}'''
-
-content = content.replace(old_update_clients, new_update_clients)
-
-old_walt_halt = '''	else
-		update_clients(&requested_cpus, true, client, type);
-	cpumask_copy(&cur_cpus_halt_mask, cpu_halt_mask);
-	cpumask_copy(&cur_cpus_phalt_mask, cpu_partial_halt_mask);
-	sa_corectl_systrace_c();
-unlock:'''
-
-new_walt_halt = '''	else
-		update_clients(&requested_cpus, true, client, type);
-#ifdef CONFIG_OPLUS_ADD_CORE_CTRL_MASK
-	cpumask_copy(&cur_cpus_halt_mask, cpu_halt_mask);
-	cpumask_copy(&cur_cpus_phalt_mask, cpu_partial_halt_mask);
-	sa_corectl_systrace_c();
-#endif
-unlock:'''
-
-content = content.replace(old_walt_halt, new_walt_halt)
-
-old_walt_start = '''		/* restore/increment ref counts in case of error */
-		update_clients(&requested_cpus, true, client, type);
-	}
-	cpumask_copy(&cur_cpus_halt_mask, cpu_halt_mask);
-	cpumask_copy(&cur_cpus_phalt_mask, cpu_partial_halt_mask);
-	sa_corectl_systrace_c();
-	raw_spin_unlock_irqrestore(&halt_lock, flags);'''
-
-new_walt_start = '''		/* restore/increment ref counts in case of error */
-		update_clients(&requested_cpus, true, client, type);
-	}
-#ifdef CONFIG_OPLUS_ADD_CORE_CTRL_MASK
-	cpumask_copy(&cur_cpus_halt_mask, cpu_halt_mask);
-	cpumask_copy(&cur_cpus_phalt_mask, cpu_partial_halt_mask);
-	sa_corectl_systrace_c();
-#endif
-	raw_spin_unlock_irqrestore(&halt_lock, flags);'''
-
-content = content.replace(old_walt_start, new_walt_start)
-
-with open(file_path, "w") as f:
-    f.write(content)
-
-print("Fixed walt_halt.c")
-PYEOF
-
-              python3 /tmp/fix_walt_halt.py
+              sed -i '/pause_client_state = per_cpu_ptr(oplus_cur_pause_client/i\#ifdef CONFIG_OPLUS_ADD_CORE_CTRL_MASK' "$WALT_HALT_FILE"
+              sed -i '/halt_cpu_state->client_vote_mask\[type\] &= ~client;/{n;s/}/}\n#endif/}' "$WALT_HALT_FILE"
+              
+              sed -i '/int \*pause_client_state;/i\#ifdef CONFIG_OPLUS_ADD_CORE_CTRL_MASK' "$WALT_HALT_FILE"
+              sed -i '/struct halt_cpu_state \*halt_cpu_state;/{n;s/int \*pause_client_state;/#endif\n\tint *pause_client_state;/}' "$WALT_HALT_FILE"
+              
+              sed -i 's|^\tcpumask_copy(&cur_cpus_halt_mask, cpu_halt_mask);|\t#ifdef CONFIG_OPLUS_ADD_CORE_CTRL_MASK\n\tcpumask_copy(\&cur_cpus_halt_mask, cpu_halt_mask);|' "$WALT_HALT_FILE"
+              sed -i 's|^\tsa_corectl_systrace_c();|\tsa_corectl_systrace_c();\n\t#endif|' "$WALT_HALT_FILE"
+              
               echo "✓ 已修复 walt_halt.c"
             fi
 
