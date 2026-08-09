@@ -479,8 +479,6 @@ file_path = "msm-kernel/kernel/sched/walt/walt_halt.c"
 with open(file_path, "r") as f:
     content = f.read()
 
-# 修复 update_clients 函数中的 oplus_cur_pause_client 引用
-# 将整个函数体用 #ifdef 保护
 old_update_clients = '''static void update_clients(struct cpumask *cpus, bool halt, enum pause_client client,
 			   enum pause_type type)
 {
@@ -525,7 +523,6 @@ new_update_clients = '''static void update_clients(struct cpumask *cpus, bool ha
 
 content = content.replace(old_update_clients, new_update_clients)
 
-# 修复 walt_halt_cpus 函数中的 cur_cpus_halt_mask 等引用
 old_walt_halt = '''	else
 		update_clients(&requested_cpus, true, client, type);
 	cpumask_copy(&cur_cpus_halt_mask, cpu_halt_mask);
@@ -544,7 +541,6 @@ unlock:'''
 
 content = content.replace(old_walt_halt, new_walt_halt)
 
-# 修复 walt_start_cpus 函数中的 cur_cpus_halt_mask 等引用
 old_walt_start = '''		/* restore/increment ref counts in case of error */
 		update_clients(&requested_cpus, true, client, type);
 	}
@@ -568,7 +564,7 @@ content = content.replace(old_walt_start, new_walt_start)
 with open(file_path, "w") as f:
     f.write(content)
 
-print("已修复 walt_halt.c 中未保护的 OnePlus 符号引用")
+print("Fixed walt_halt.c")
 PYEOF
 
               python3 /tmp/fix_walt_halt.py
