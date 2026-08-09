@@ -1,80 +1,274 @@
-name: Build OnePlus Pad 2 Pro GKI Kernel
+name: Build OnePlus Pad 2 Pro GKI boot.img
+
+# 官方构建方式参考:
+#   OnePlusOSS/kernel_manifest 仓库 README:
+#     ./kernel_platform/oplus/build/oplus_build_kernel.sh <platform> <variant>
+#   OnePlus Pad 2 Pro (SM8750) 的 platform = sun, GKI user 版用 variant = perf
+#   底层调用: build_with_bazel.py -t sun perf --out_dir out/msm-kernel-sun-perf
+#   产物路径: out/msm-kernel-sun-perf/dist/
+#
+# 产物清单 (来自 msm_kernel_la.bzl 的 _define_image_build):
+#   perf 变体 (define_abi_targets=True, GKI 路径):
+#     - boot.img / init_boot.img  来自 //common:kernel_aarch64 (GKI 内核, 已注入 sun dtb)
+#     - dtbo.img                  build_dtbo=True (sun 有 dtbo_list)
+#     - vendor_boot.img           build_vendor_boot=True (sun 有 dtbo_list)
+#     - vendor_dlkm.img           build_vendor_dlkm=True (默认)
+#     - system_dlkm.img           不会生成 (build_system_dlkm 默认 False; build.config 里的
+#                                 PREPARE_SYSTEM_DLKM 是给旧 build_utils.sh 用的, 不影响 bazel)
+#   consolidate 变体 (define_abi_targets=False, 非标准 GKI):
+#     - boot.img                  build_boot=True (本 target 自建, 不走 GKI common)
+#     - 其余同 perf
+# boot.img 参数 (来自 build.config.msm.sun + sun.bzl):
+#   BOOT_IMAGE_HEADER_VERSION=4, BASE_ADDRESS=0x80000000, PAGE_SIZE=4096
+#   perf 变体 cmdline: 'nosoftlockup console=ttynull qcom_geni_serial.con_enabled=0 ...'
+#   consolidate 变体 cmdline: 'console=ttynull qcom_geni_serial.con_enabled=0 earlycon ...'
 
 on:
   workflow_dispatch:
     inputs:
-      KERNEL_REPO:
-        description: 'Kernel Source URL'
+      MANIFEST_BRANCH:
+        description: 'kernel_manifest 仓库分支'
         required: true
-        default: 'https://github.com/OnePlusOSS/android_kernel_oneplus_sm8750'
-      KERNEL_BRANCH:
-        description: 'Kernel Branch'
+        default: 'oneplus/sm8750'
+
+      MANIFEST_FILE:
+        description: 'manifest 文件名 (在 kernel_manifest 仓库根目录)'
         required: true
-        default: 'oneplus/sm8750_b_16.0.0_pad_2_pro'
+        default: 'oneplus_pad_2_pro_b.xml'
+
+      KERNEL_PLATFORM:
+        description: '平台代号 (SM8750 = sun)'
+        required: true
+        default: 'sun'
+
+      KERNEL_VARIANT:
+        description: '构建变体: perf=user(GKI 正式版) / consolidate=userdebug(非标准 GKI, 模块内置)'
+        required: true
+        type: choice
+        default: 'perf'
+        options:
+          - 'perf'
+          - 'consolidate'
 
 jobs:
   build:
+    name: Build OnePlus Pad 2 Pro GKI kernel
     runs-on: ubuntu-22.04
+    timeout-minutes: 600
+
+    env:
+      MANIFEST_BRANCH: ${{ github.event.inputs.MANIFEST_BRANCH }}
+      MANIFEST_FILE: ${{ github.event.inputs.MANIFEST_FILE }}
+      KERNEL_PLATFORM: ${{ github.event.inputs.KERNEL_PLATFORM }}
+      KERNEL_VARIANT: ${{ github.event.inputs.KERNEL_VARIANT }}
+
     steps:
-      - name: Maximize Build Space
+      - name: "🚀 Maximize Build Space"
         uses: easimon/maximize-build-space@master
         with:
-          root-reserve-mb: 24576
-          swap-size-mb: 8192
+          root-reserve-mb: 28672
+          temp-reserve-mb: 8192
           remove-dotnet: 'true'
           remove-android: 'true'
           remove-haskell: 'true'
-          remove-bloat: 'true'
+          remove-codeql: 'true'
 
-      - name: Install Dependencies
+      - name: "📦 Install Build Dependencies"
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev lib32z1-dev libelf-dev liblz4-tool libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc yasm zlib1g-dev python3 python-is-python3 python3-pip bazel
+          sudo apt-get install -y \
+            python3 python-is-python3 git curl wget ccache \
+            build-essential flex bison libssl-dev libncurses-dev zlib1g-dev \
+            rsync unzip gawk dos2unix bc \
+            libelf-dev pkg-config gcc-aarch64-linux-gnu clang lld llvm \
+            openjdk-17-jdk android-sdk-libsparse-utils \
+            lib32ncurses5-dev lib32z1-dev libxml2-utils lzop pngcrush \
+            schedtool squashfs-tools xsltproc yasm cpio
 
-      - name: Clone Kernel Source
+      - name: "📥 Install Repo Tool"
         run: |
-          git config --global user.name "GitHub Actions"
-          git config --global user.email "actions@github.com"
-          git clone --depth=1 ${{ github.event.inputs.KERNEL_REPO }} -b ${{ github.event.inputs.KERNEL_BRANCH }} kernel_source
+          # repo 工具依赖 git user.name/user.email, 否则 repo init 会失败
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
+          chmod a+x ~/repo
+          sudo mv ~/repo /usr/local/bin/repo
+          repo --version
 
-      - name: Build SM8750 GKI Kernel (Kleaf)
+      - name: "📥 Init & Sync Manifest"
         run: |
-          cd kernel_source
-          
-          # 检查并使用 Kleaf (Bazel) 编译系统
-          if [ -f "tools/bazel" ]; then
-            echo "Building using tools/bazel..."
-            # 常见 DIST 目标，可根据当前分支的 BUILD 文件调整
-            tools/bazel run //common:kernel_aarch64_dist -- --dist_dir=out/dist
-          elif [ -f "build/bazel.sh" ]; then
-            echo "Building using build/bazel.sh..."
-            bash build/bazel.sh
-          elif [ -f "build/build.sh" ]; then
-            echo "Building using build.sh..."
-            bash build/build.sh
-          else
-            echo "No standard build script found!"
+          set -euo pipefail
+          mkdir -p kernel_workspace
+          cd kernel_workspace
+
+          # 用官方 manifest 同步完整 kernel_platform 布局:
+          #   kernel_platform/common        <- android_kernel_common_oneplus_sm8750 (GKI 内核)
+          #   kernel_platform/msm-kernel    <- android_kernel_oneplus_sm8750 (设备内核, 含 build_with_bazel.py)
+          #   ./                            <- android_kernel_modules_and_devicetree_oneplus_sm8750 (oplus 构建脚本 + vendor 模块/dt)
+          #   kernel_platform/prebuilts/... <- 预编译 clang/jdk/build-tools (来自 codelinaro)
+          #   kernel_platform/tools/mkbootimg <- mkbootimg 工具
+          repo init -u https://github.com/OnePlusOSS/kernel_manifest.git \
+            -b "${MANIFEST_BRANCH}" \
+            -m "${MANIFEST_FILE}" \
+            --depth=1
+
+          repo sync -c -j"$(nproc --all)" --no-tags --no-clone-bundle --force-sync
+
+          echo "📂 workspace root"
+          ls -la
+          echo ""
+          echo "📂 kernel_platform"
+          ls -la kernel_platform/ | head -30
+
+      - name: "🔍 Verify Build Inputs"
+        run: |
+          set -euo pipefail
+          cd kernel_workspace
+          test -f kernel_platform/oplus/build/oplus_build_kernel.sh || { echo "oplus_build_kernel.sh missing"; exit 1; }
+          test -f kernel_platform/build_with_bazel.py || { echo "build_with_bazel.py missing"; exit 1; }
+          test -x kernel_platform/tools/bazel || { echo "tools/bazel missing"; exit 1; }
+          test -f kernel_platform/msm-kernel/build.config.msm.sun || { echo "build.config.msm.sun missing"; exit 1; }
+          test -d kernel_platform/prebuilts/clang/host/linux-x86 || { echo "prebuilts/clang missing"; exit 1; }
+          echo "✅ All build inputs ready"
+
+      - name: "⚙️ Apply Custom Kernel Config"
+        run: |
+          set -euo pipefail
+          cd kernel_workspace
+
+          # 自定义内核配置项 (追加到 vendor/sun_perf.config, 会被 gki_defconfig 合并进最终 .config)
+          # 这些是 POSIX IPC / Namespace 相关, 默认 GKI 可能未全开
+          CUSTOM_CONFIGS=(
+            "CONFIG_SYSVIPC=y"
+            "CONFIG_POSIX_MQUEUE=y"
+            "CONFIG_IPC_NS=y"
+            "CONFIG_PID_NS=y"
+          )
+
+          # sun perf 变体用的 vendor config 文件
+          CONFIG_FILE="kernel_platform/msm-kernel/arch/arm64/configs/vendor/sun_perf.config"
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "❌ $CONFIG_FILE not found"
+            echo "listing vendor config dir:"
+            ls kernel_platform/msm-kernel/arch/arm64/configs/vendor/ 2>/dev/null || true
             exit 1
           fi
 
-      - name: Collect Kernel Image and All Driver Modules (.ko)
-        run: |
-          cd kernel_source
-          mkdir -p final_output/modules
-          
-          # 1. 收集核心内核镜像和设备树
-          find . -name "Image" -o -name "Image.gz" -o -name "*.dtb" | while read file; do
-            cp "$file" final_output/
-          done
-          
-          # 2. 强制把编译生成的 Wi-Fi、蓝牙等所有 .ko 动态模块全部抓取出来
-          # 确保驱动模块不遗漏，避免开机无 Wi-Fi/蓝牙
-          find . -name "*.ko" -exec cp {} final_output/modules/ \;
-          
-          echo "Successfully collected Image and $(ls final_output/modules | wc -l) driver modules."
+          echo "🔧 Before patch, tail of $CONFIG_FILE:"
+          tail -5 "$CONFIG_FILE"
 
-      - name: Upload Kernel Artifacts
+          echo "" >> "$CONFIG_FILE"
+          echo "# === Custom configs from CI ($(date -u +%Y-%m-%dT%H:%M:%SZ)) ===" >> "$CONFIG_FILE"
+          for config in "${CUSTOM_CONFIGS[@]}"; do
+            KEY="${config%%=*}"
+            # 移除已存在的同 key 行 (无论 =y/=n/=m/# CONFIG is not set)
+            sed -i "/^${KEY}[= ]/d; /^# ${KEY} is not set/d" "$CONFIG_FILE"
+            # 追加新配置
+            echo "$config" >> "$CONFIG_FILE"
+            echo "  + $config"
+          done
+
+          echo ""
+          echo "🔧 After patch, tail of $CONFIG_FILE:"
+          tail -10 "$CONFIG_FILE"
+
+      - name: "🔨 Build Kernel via Official Script"
+        run: |
+          set -euo pipefail
+          cd kernel_workspace
+
+          # 官方构建命令 (来自 OnePlusOSS/kernel_manifest README 与 oplus_build_kernel.sh):
+          #   ./kernel_platform/oplus/build/oplus_build_kernel.sh <platform> <variant>
+          # 内部流程:
+          #   1. source oplus_setup.sh -> 设置 OPLUS_VND_BUILD_PLATFORM=SM8750, EXTRA_KBUILD_ARGS=--skip abl 等
+          #   2. 调用 ./kernel_platform/build/android/prepare_vendor.sh <platform> <variant>
+          #   3. prepare_vendor.sh 调用 brunch 生成 build.config, 然后执行:
+          #        build_with_bazel.py -t <platform> <variant> --out_dir out/msm-kernel-<platform>-<variant>
+          #   4. build_with_bazel.py 调用 tools/bazel build + tools/bazel run ..._dist -- --dist_dir=<out>/dist
+          #   5. 官方脚本直接产出 boot.img / dtbo.img / vendor_boot.img / vendor_dlkm.img 等
+          ./kernel_platform/oplus/build/oplus_build_kernel.sh "${KERNEL_PLATFORM}" "${KERNEL_VARIANT}" 2>&1 | tee build_full.log
+
+      - name: "📦 Collect Artifacts"
+        if: always()
+        run: |
+          set -euo pipefail
+          cd kernel_workspace
+
+          DIST_DIR="kernel_platform/out/msm-kernel-${KERNEL_PLATFORM}-${KERNEL_VARIANT}/dist"
+          if [ ! -d "$DIST_DIR" ]; then
+            echo "❌ dist dir not found: $DIST_DIR"
+            echo "listing kernel_platform/out:"
+            ls -la kernel_platform/out/ 2>/dev/null || true
+            exit 0
+          fi
+
+          mkdir -p Final-Image/modules
+          # boot.img / init_boot.img: perf 变体来自 GKI common 内核, consolidate 变体本 target 自建
+          cp -v "$DIST_DIR"/boot.img         Final-Image/ 2>/dev/null || true
+          cp -v "$DIST_DIR"/init_boot.img    Final-Image/ 2>/dev/null || true
+          # dtbo.img / vendor_boot.img: sun 平台有 dtbo_list, 两个都会生成
+          cp -v "$DIST_DIR"/dtbo.img         Final-Image/ 2>/dev/null || true
+          cp -v "$DIST_DIR"/vendor_boot.img  Final-Image/ 2>/dev/null || true
+          # vendor_dlkm.img: build_vendor_dlkm 默认 True
+          cp -v "$DIST_DIR"/vendor_dlkm.img  Final-Image/ 2>/dev/null || true
+          # 注: system_dlkm.img 不会生成 (bazel build_system_dlkm 默认 False)
+
+          cp -v "$DIST_DIR"/Image            Final-Image/ 2>/dev/null || true
+          cp -v "$DIST_DIR"/Image.gz         Final-Image/ 2>/dev/null || true
+          cp -v "$DIST_DIR"/Image.lz4        Final-Image/ 2>/dev/null || true
+          cp -v "$DIST_DIR"/System.map       Final-Image/ 2>/dev/null || true
+          cp -v "$DIST_DIR"/.config          Final-Image/kernel.config 2>/dev/null || true
+          cp -v "$DIST_DIR"/abi.xml          Final-Image/ 2>/dev/null || true
+          cp -v "$DIST_DIR"/abi_symbollist   Final-Image/ 2>/dev/null || true
+
+          # 内核模块
+          find "$DIST_DIR" -maxdepth 1 -name '*.ko' -type f -exec cp -v {} Final-Image/modules/ \; 2>/dev/null || true
+
+          # 构建日志
+          cp -v build_full.log Final-Image/ 2>/dev/null || true
+
+          echo ""
+          echo "📦 Final-Image layout:"
+          find Final-Image -maxdepth 2 -type f | sort | sed 's#^#  - #'
+
+      - name: "📤 Upload Boot Images"
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: OnePlus-Pad-2-Pro-Kernel-Outputs
-          path: kernel_source/final_output/
+          name: OnePlus-Pad-2-Pro-GKI-boot-${{ github.event.inputs.KERNEL_VARIANT }}
+          path: |
+            kernel_workspace/Final-Image/boot.img
+            kernel_workspace/Final-Image/init_boot.img
+            kernel_workspace/Final-Image/dtbo.img
+            kernel_workspace/Final-Image/vendor_boot.img
+            kernel_workspace/Final-Image/vendor_dlkm.img
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: "📤 Upload Kernel Image & Symbols"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OnePlus-Pad-2-Pro-GKI-kernel-${{ github.event.inputs.KERNEL_VARIANT }}
+          path: |
+            kernel_workspace/Final-Image/Image
+            kernel_workspace/Final-Image/Image.gz
+            kernel_workspace/Final-Image/Image.lz4
+            kernel_workspace/Final-Image/System.map
+            kernel_workspace/Final-Image/kernel.config
+            kernel_workspace/Final-Image/abi.xml
+            kernel_workspace/Final-Image/abi_symbollist
+            kernel_workspace/Final-Image/modules/
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: "📤 Upload Build Log"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OnePlus-Pad-2-Pro-GKI-buildlog-${{ github.event.inputs.KERNEL_VARIANT }}
+          path: |
+            kernel_workspace/build_full.log
+            kernel_workspace/Final-Image/build_full.log
+          retention-days: 7
+          if-no-files-found: warn
