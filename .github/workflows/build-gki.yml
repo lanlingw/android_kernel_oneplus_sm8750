@@ -1,796 +1,353 @@
 name: Build GKI Kernel (OnePlus SM8750)
 
-# 使用 OnePlus 官方 kernel_manifest 仓库拉取完整编译工作区。
-# Manifest 包含 3 个 OnePlus 仓库 + CodeLinaro QCOM 依赖：
-#   - android_kernel_common_oneplus_sm8750  → kernel_platform/common/   (GKI 通用内核)
-#   - android_kernel_oneplus_sm8750         → kernel_platform/msm-kernel/ (MSM 设备内核)
-#   - android_kernel_modules_and_devicetree_oneplus_sm8750 → ./ (模块和设备树)
-#
-# 工作区结构（repo sync 后）：
-#   android-kernel/
-#   ├── WORKSPACE / tools/bazel    ← Bazel 工作区（来自 modules 仓库）
-#   ├── kernel_platform/
-#   │   ├── common/                ← GKI 通用内核
-#   │   ├── msm-kernel/            ← MSM 设备内核（含 pineapple 平台配置）
-#   │   ├── build/                 ← Bazel 编译规则
-#   │   ├── prebuilts/             ← 工具链（clang/rust/jdk 等）
-#   │   └── external/              ← 外部依赖
-#   └── ...
-
-on:
+"on":
   workflow_dispatch:
     inputs:
-      manifest_file:
-        description: '选择设备和 Android 版本（manifest 文件）'
+      BUILD_MODE:
+        description: "选择构建模式"
         required: true
-        default: 'oneplus_pad_2_pro_b.xml'
         type: choice
+        default: "kernel-only"
         options:
-          - oneplus_pad_2_pro_b.xml
-          - oneplus_pad_2_pro.xml
-          - oneplus_13_b.xml
-          - oneplus_13.xml
-          - oneplus_13s_b.xml
-          - oneplus_13t_b.xml
-          - oneplus_ace5_pro_b.xml
-          - oneplus_pad_3.xml
-      build_target:
-        description: '编译目标（GKI 通用内核 或 设备专属内核）'
-        required: true
-        default: 'gki'
-        type: choice
-        options:
-          - gki
-          - pineapple
-      custom_configs:
-        description: '自定义内核配置（每行一个，如 CONFIG_PID_NS=y）。留空则使用默认配置。'
+          - "kernel-only"
+          - "gki"
+          - "both"
+      CUSTOM_CONFIG:
+        description: "自定义内核配置项（逗号分隔，例如 CONFIG_SYSVIPC=y,CONFIG_POSIX_MQUEUE=y）"
         required: false
-        default: ''
         type: string
-
-env:
-  MANIFEST_URL: https://github.com/OnePlusOSS/kernel_manifest
-  MANIFEST_BRANCH: oneplus/sm8750
-  WORKSPACE: android-kernel
+        default: "CONFIG_SYSVIPC=y,CONFIG_POSIX_MQUEUE=y,CONFIG_IPC_NS=y,CONFIG_PID_NS=y"
 
 jobs:
   build:
-    name: Build Kernel
-    runs-on: ubuntu-22.04
-    timeout-minutes: 360
+    name: Build OnePlus Pad 2 Pro kernel
+    runs-on: ubuntu-latest
+    timeout-minutes: 480
+
+    env:
+      CCACHE_MAXSIZE: 8G
+      CUSTOM_CONFIG: ${{ github.event.inputs.CUSTOM_CONFIG }}
+      BUILD_MODE: ${{ github.event.inputs.BUILD_MODE }}
 
     steps:
-      # ============================================================
-      # 1. 释放磁盘空间
-      # ============================================================
-      - name: Free up disk space
-        uses: jlumbroso/free-disk-space@main
+      - name: "🚀 Maximize Build Space"
+        uses: easimon/maximize-build-space@master
         with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: false
-          swap-storage: true
+          root-reserve-mb: 24576
+          temp-reserve-mb: 8192
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
 
-      - name: Check available resources
-        run: |
-          echo "=== 磁盘空间 ==="
-          df -h /
-          echo "CPU: $(nproc) 核 | 内存: $(free -h | awk '/^Mem:/{print $2}')"
-
-      # ============================================================
-      # 2. 解析参数
-      # ============================================================
-      - name: Resolve parameters
-        id: params
-        run: |
-          MANIFEST_FILE="${{ github.event.inputs.manifest_file || 'oneplus_pad_2_pro_b.xml' }}"
-          BUILD_TARGET="${{ github.event.inputs.build_target || 'gki' }}"
-
-          MANIFEST_NAME="${MANIFEST_FILE%.xml}"
-
-          echo "manifest_file=$MANIFEST_FILE" >> $GITHUB_OUTPUT
-          echo "manifest_name=$MANIFEST_NAME" >> $GITHUB_OUTPUT
-          echo "build_target=$BUILD_TARGET" >> $GITHUB_OUTPUT
-
-          # 根据编译目标设置 Bazel target
-          # pineapple 有多个变体（perf/consolidate），默认使用 perf
-          if [ "$BUILD_TARGET" = "gki" ]; then
-            BAZEL_TARGET="//kernel_platform/common:kernel_aarch64_dist"
-          else
-            BAZEL_TARGET="//kernel_platform/msm-kernel:pineapple_perf_dist"
-          fi
-          echo "bazel_target=$BAZEL_TARGET" >> $GITHUB_OUTPUT
-
-          echo "=== 编译参数 ==="
-          echo "Manifest 文件:  $MANIFEST_FILE"
-          echo "编译目标:       $BUILD_TARGET"
-          echo "Bazel target:   $BAZEL_TARGET"
-
-      # ============================================================
-      # 3. 安装编译依赖 + repo 工具
-      # ============================================================
-      - name: Install build dependencies and repo tool
+      - name: "📦 Install Build Dependencies"
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            bc bison build-essential cpio flex git \
-            libncurses-dev libssl-dev libelf-dev \
-            python3 python3-pip python-is-python3 \
-            zip unzip wget curl lz4 ccache \
-            openjdk-17-jdk-headless dwarves zstd \
-            libxml2-utils
+            python3 git curl ccache \
+            build-essential flex bison libssl-dev libncurses-dev zlib1g-dev \
+            rsync unzip gawk dos2unix bc \
+            libelf-dev pkg-config gcc-aarch64-linux-gnu clang lld llvm \
+            openjdk-17-jdk
 
-          # 安装 Google repo 工具
-          sudo curl -o /usr/local/bin/repo \
-            https://storage.googleapis.com/git-repo-downloads/repo
-          sudo chmod a+x /usr/local/bin/repo
-
-          git config --global user.name "GitHub Actions"
-          git config --global user.email "actions@github.com"
-
-          echo "=== 工具版本 ==="
-          repo version
-          gcc --version | head -1
-          python3 --version
-
-      # ============================================================
-      # 4. 初始化 repo manifest（OnePlus 官方 manifest）
-      #    使用 -m 指定设备专属 manifest 文件
-      # ============================================================
-      - name: Initialize repo manifest
+      - name: "📥 Install Repo Tool"
         run: |
-          mkdir -p ${{ env.WORKSPACE }}
-          cd ${{ env.WORKSPACE }}
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
+          chmod a+x ~/repo
+          sudo mv ~/repo /usr/local/bin/repo
+          repo --version
 
-          repo init -u ${{ env.MANIFEST_URL }} \
-            -b ${{ env.MANIFEST_BRANCH }} \
-            -m ${{ steps.params.outputs.manifest_file }} \
-            --depth 1
-
-          echo "=== Manifest: ${{ steps.params.outputs.manifest_file }} ==="
-          echo "=== 分支: ${{ env.MANIFEST_BRANCH }} ==="
-
-      # ============================================================
-      # 5. 同步源码
-      #    包含 OnePlus 3 个仓库 + CodeLinaro QCOM 依赖
-      #    CodeLinaro 可能较慢，先全量同步再重试失败的项目
-      # ============================================================
-      - name: Sync source code
+      - name: "📥 Init & Sync Repos"
         run: |
-          cd ${{ env.WORKSPACE }}
+          set -euo pipefail
+          mkdir -p kernel_workspace
+          cd kernel_workspace
 
-          echo "=== 第一次同步（全量）==="
-          repo sync -c --no-tags --no-clone-bundle -j$(nproc) || true
+          repo init -u https://github.com/OnePlusOSS/kernel_manifest.git \
+            -b oneplus/sm8750 \
+            -m oneplus_pad_2_pro_b.xml \
+            --depth=1
 
-          echo ""
-          echo "=== 第二次同步（重试失败项目）==="
-          repo sync -c --no-tags --no-clone-bundle -j4
+          repo sync -c -j"$(nproc --all)" --no-tags --no-clone-bundle --force-sync
 
+          echo "📂 workspace" 
+          ls -la
           echo ""
-          echo "=== 同步完成，工作区结构 ==="
-          ls -la | head -25
+          echo "📂 kernel_platform"
+          ls -la kernel_platform/
           echo ""
-          echo "=== kernel_platform/ 目录 ==="
-          ls kernel_platform/ 2>/dev/null | head -20
+          echo "📂 common" 
+          head -20 < <(ls -la kernel_platform/common/)
           echo ""
-          echo "=== kernel_platform/common/ 前 15 项 ==="
-          ls kernel_platform/common/ 2>/dev/null | head -15
-          echo ""
-          echo "=== kernel_platform/msm-kernel/ 前 15 项 ==="
-          ls kernel_platform/msm-kernel/ 2>/dev/null | head -15
-          echo ""
-          echo "=== 磁盘使用 ==="
-          du -sh . 2>/dev/null
-          df -h /
+          echo "📂 msm-kernel"
+          head -20 < <(ls -la kernel_platform/msm-kernel/)
 
-      # ============================================================
-      # 6. 缓存 ccache
-      # ============================================================
-      - name: Setup ccache
+      - name: "🔍 Check Build Inputs"
+        run: |
+          set -euo pipefail
+          cd kernel_workspace/kernel_platform
+
+          test -d common || { echo "common directory missing"; exit 1; }
+          test -d msm-kernel || { echo "msm-kernel directory missing"; exit 1; }
+          test -f common/Makefile || { echo "common/Makefile missing"; exit 1; }
+          test -f msm-kernel/Makefile || { echo "msm-kernel/Makefile missing"; exit 1; }
+
+          echo "✅ common tree ready"
+          echo "✅ msm-kernel tree ready"
+
+      - name: "🔧 Setup ccache"
+        run: |
+          echo "CCACHE_DIR=$HOME/.ccache_pad2pro" >> "$GITHUB_ENV"
+          mkdir -p "$HOME/.ccache_pad2pro"
+          ccache -M "$CCACHE_MAXSIZE"
+          ccache -s
+
+      - name: "💾 Restore ccache"
         uses: actions/cache@v4
         with:
-          path: ~/.ccache
-          key: ccache-${{ steps.params.outputs.build_target }}-${{ steps.params.outputs.manifest_file }}-${{ github.sha }}
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-pad2pro-${{ runner.os }}-${{ github.ref_name }}
           restore-keys: |
-            ccache-${{ steps.params.outputs.build_target }}-${{ steps.params.outputs.manifest_file }}-
+            ccache-pad2pro-${{ runner.os }}-
 
-      # ============================================================
-      # 7. 应用自定义内核配置
-      #    使用 Kleaf 的 defconfig_fragments 机制
-      #    GKI: 修改 BUILD.bazel 中 define_common_kernels 宏的 kernel_aarch64 配置字典
-      #    MSM: 修改 pineapple.bzl + msm_kernel_la.bzl 传递 defconfig_fragments 参数
-      # ============================================================
-      - name: Apply custom kernel configs
+      - name: "🔧 Apply Custom Kernel Config"
         run: |
-          cd ${{ env.WORKSPACE }}
-          CUSTOM_CONFIGS="${{ github.event.inputs.custom_configs }}"
+          set -euo pipefail
+          cd kernel_workspace/kernel_platform/common
 
-          if [ -z "$CUSTOM_CONFIGS" ]; then
-            echo "无自定义配置，使用默认内核配置"
-            exit 0
-          fi
-
-          BUILD_TARGET="${{ steps.params.outputs.build_target }}"
-          echo "=== 自定义内核配置 ==="
-          echo "$CUSTOM_CONFIGS"
-          echo ""
-
-          # 自定义配置始终应用到 common 构建
-          # 因为 pineapple 使用 mixed build，内核镜像来自 common 的 base_kernel
-          KERNEL_DIR="kernel_platform/common"
-
-          FRAGMENT_FILE="user_custom.config"
-          FRAGMENT_PATH="$KERNEL_DIR/arch/arm64/configs/$FRAGMENT_FILE"
-
-          # 1. 创建配置片段文件（支持逗号、分号、换行分隔）
-          mkdir -p "$KERNEL_DIR/arch/arm64/configs"
-          echo "=== 创建配置片段: $FRAGMENT_PATH ==="
-          echo "$CUSTOM_CONFIGS" | tr ',;' '\n\n' | sed '/^[[:space:]]*$/d' > "$FRAGMENT_PATH"
-          echo "片段内容:"
-          cat "$FRAGMENT_PATH"
-          echo ""
-          
-          # 如果是 pineapple 构建，同时在 msm-kernel 目录下创建配置片段
-          if [ "$BUILD_TARGET" != "gki" ]; then
-            MSM_KERNEL_DIR="kernel_platform/msm-kernel"
-            MSM_FRAGMENT_PATH="$MSM_KERNEL_DIR/arch/arm64/configs/$FRAGMENT_FILE"
-            mkdir -p "$MSM_KERNEL_DIR/arch/arm64/configs"
-            echo "=== 创建配置片段: $MSM_FRAGMENT_PATH ==="
-            cp "$FRAGMENT_PATH" "$MSM_FRAGMENT_PATH"
-            echo "已复制到 msm-kernel 目录"
-          fi
-
-          # 2. 将 Python 脚本写入文件并执行
-          cat > /tmp/apply_custom_config.py << 'PYEOF'
-          import re
-          import sys
-          import os
-
-          build_target = sys.argv[1]
-          fragment_file = "arch/arm64/configs/user_custom.config"
-          kernel_dir = "kernel_platform/common"  # 始终修改 common 构建
-
-          # 始终修改 common 构建（无论 gki 还是 pineapple）
-          # 因为 pineapple 使用 mixed build，内核镜像来自 common 的 base_kernel
-          build_bazel = os.path.join("kernel_platform/common", "BUILD.bazel")
-          print(f"=== 修改 {build_bazel} ===")
-
-          if not os.path.exists(build_bazel):
-              print(f"错误: {build_bazel} 不存在")
-              sys.exit(1)
-
-          with open(build_bazel, "r") as f:
-              content = f.read()
-
-          # 在 kernel_aarch64 配置字典中，找到 "make_goals": _GKI_AARCH64_MAKE_GOALS,
-          # 在其后添加 defconfig_fragments
-          pattern = r'("make_goals":\s*_GKI_AARCH64_MAKE_GOALS,)'
-          replacement = f'\\1\n        "defconfig_fragments": ["{fragment_file}"],'
-
-          new_content, count = re.subn(pattern, replacement, content, count=1)
-
-          if count == 0:
-              print("ERROR: 未找到 make_goals 在 BUILD.bazel 中")
-              sys.exit(1)
-
-          with open(build_bazel, "w") as f:
-              f.write(new_content)
-
-          print(f"已在 BUILD.bazel 的 kernel_aarch64 配置中添加 defconfig_fragments")
-
-          # 如果是 pineapple，额外修改 msm-kernel（可选，用于模块配置）
-          if build_target != "gki":
-              # ============================================================
-              # MSM/pineapple: 修改 msm_kernel_la.bzl + pineapple.bzl
-              # ============================================================
-              msm_kernel_dir = "kernel_platform/msm-kernel"
-              msm_kernel_la = os.path.join(msm_kernel_dir, "msm_kernel_la.bzl")
-              pineapple_bzl = os.path.join(msm_kernel_dir, "pineapple.bzl")
-
-              print(f"=== 修改 {msm_kernel_la} + {pineapple_bzl} ===")
-
-              if not os.path.exists(msm_kernel_la):
-                  print(f"错误: {msm_kernel_la} 不存在")
-                  sys.exit(1)
-
-              if not os.path.exists(pineapple_bzl):
-                  print(f"错误: {pineapple_bzl} 不存在")
-                  sys.exit(1)
-
-              # ========== 1. 修改 msm_kernel_la.bzl ==========
-              with open(msm_kernel_la, "r") as f:
-                  content = f.read()
-
-              # 1a. 在 define_msm_la 函数签名中添加 defconfig_fragments 参数
-              content = re.sub(
-                  r'def define_msm_la\(\s*msm_target,\s*variant,\s*in_tree_module_list,\s*kmi_enforced = True,\s*boot_image_opts = boot_image_opts\(\)\):',
-                  'def define_msm_la(msm_target, variant, in_tree_module_list, kmi_enforced = True, boot_image_opts = boot_image_opts(), defconfig_fragments = []):',
-                  content
-              )
-
-              # 1b. 将 defconfig_fragments 传递给 _define_kernel_build
-              content = re.sub(
-                r'(        kmi_enforced,)',
-                r'\1\n        defconfig_fragments,',
-                content
-              )
-
-              # 1c. 在 _define_kernel_build 函数签名中添加 defconfig_fragments 参数
-              content = re.sub(
-                  r'def _define_kernel_build\(\s*target,\s*base_kernel,\s*in_tree_module_list,\s*dtb_list,\s*dtbo_list,\s*dtstree,\s*define_abi_targets,\s*kmi_enforced\):',
-                  'def _define_kernel_build(target, base_kernel, in_tree_module_list, dtb_list, dtbo_list, dtstree, define_abi_targets, kmi_enforced, defconfig_fragments = []):',
-                  content
-              )
-
-              # 1d. 在 kernel_build 调用中添加 defconfig_fragments
-              content = re.sub(
-                  r'(        collect_unstripped_modules = define_abi_targets,)',
-                  r'\1\n        defconfig_fragments = defconfig_fragments,',
-                  content
-              )
-
-              with open(msm_kernel_la, "w") as f:
-                  f.write(content)
-
-              print("已修改 msm_kernel_la.bzl: 添加 defconfig_fragments 参数传递")
-
-              # ========== 2. 修改 pineapple.bzl ==========
-              with open(pineapple_bzl, "r") as f:
-                  content = f.read()
-
-              # 在 define_msm_la 调用中添加 defconfig_fragments 参数
-              # 匹配 boot_image_opts(...) 的闭合括号，在其后添加 defconfig_fragments
-              content = re.sub(
-                  r'(boot_image_opts = boot_image_opts\(\s*earlycon_addr = "[^"]+",\s*kernel_vendor_cmdline_extras = kernel_vendor_cmdline_extras,\s*board_kernel_cmdline_extras = board_kernel_cmdline_extras,\s*board_bootconfig_extras = board_bootconfig_extras,\s*\),)',
-                  r'\1\n            defconfig_fragments = ["' + fragment_file + '"],',
-                  content
-              )
-
-              with open(pineapple_bzl, "w") as f:
-                  f.write(content)
-
-              print("已修改 pineapple.bzl: 传递 defconfig_fragments")
-
-          PYEOF
-
-          # 执行 Python 脚本
-          python3 /tmp/apply_custom_config.py "$BUILD_TARGET"
-
-          # 3. 验证修改
-          echo ""
-          echo "=== 验证修改结果 ==="
-          echo "--- common/BUILD.bazel ---"
-          grep -n 'defconfig_fragments' "kernel_platform/common/BUILD.bazel"
-
-          echo ""
-          echo "=== 配置片段文件内容 ==="
-          cat "$FRAGMENT_PATH"
-      # ============================================================
-      # 8. 编译内核
-      #    使用 Kleaf (Bazel) 编译系统
-      # ============================================================
-      - name: Build kernel
-        run: |
-          cd ${{ env.WORKSPACE }}
-
-          export CCACHE_DIR="$HOME/.ccache"
-          export PATH="/usr/lib/ccache:$PATH"
-
-          ccache -M 20G 2>/dev/null || true
-          ccache -z 2>/dev/null || true
-
-          echo "========================================"
-          echo "  内核编译"
-          echo "========================================"
-          echo "Manifest:       ${{ steps.params.outputs.manifest_file }}"
-          echo "编译目标:       ${{ steps.params.outputs.build_target }}"
-          echo "Bazel target:   ${{ steps.params.outputs.bazel_target }}"
-          echo "编译并发数:     $(nproc)"
-          echo "========================================"
-          echo ""
-
-          # 诊断：查找 tools/bazel 位置
-          echo "=== 查找 tools/bazel ==="
-          find . -name "bazel" -path "*/tools/*" -type f 2>/dev/null | head -5
-
-          # Bazel 工作区根目录是 kernel_platform/（包含 WORKSPACE 和 tools/bazel）
-          # 这是 Kleaf 构建系统的标准布局
-          BAZEL_ROOT="kernel_platform"
-          BAZEL="kernel_platform/tools/bazel"
-
-          if [ -f "$BAZEL" ]; then
-            echo "=== 找到 Bazel: $BAZEL ==="
-            chmod +x "$BAZEL" 2>/dev/null || true
-
-            # 切换到 Bazel 工作区根目录
-            cd "$BAZEL_ROOT"
-
-            # 创建必要的符号链接（模拟 build_with_bazel.py 的 setup_extensions）
-            # msm_kernel_extensions.bzl 需要从 msm-kernel 链接到 build/
-            # 注意：检查路径是相对于 kernel_platform/，符号链接目标是相对于 build/
-            MSM_EXT_SRC="msm-kernel/msm_kernel_extensions.bzl"  # 从 kernel_platform/ 检查
-            MSM_EXT_DST="build/msm_kernel_extensions.bzl"       # 符号链接位置
-            MSM_EXT_TARGET="../msm-kernel/msm_kernel_extensions.bzl"  # 从 build/ 指向目标
-
-            if [ ! -e "$MSM_EXT_DST" ] && [ -f "$MSM_EXT_SRC" ]; then
-              echo "=== 创建符号链接: $MSM_EXT_DST → $MSM_EXT_TARGET ==="
-              ln -sf "$MSM_EXT_TARGET" "$MSM_EXT_DST"
+          echo "📋 解析自定义配置..."
+          IFS=',' read -ra CFG_ARRAY <<< "$CUSTOM_CONFIG"
+          for item in "${CFG_ARRAY[@]}"; do
+            item="${item//[$'\r\n']/}"
+            item="${item#${item%%[![:space:]]*}}"
+            item="${item%${item##*[![:space:]]}}"
+            if [ -z "$item" ]; then
+              continue
             fi
-
-            # 复制 OnePlus 配置片段到 msm-kernel
-            # android_kernel_modules_and_devicetree_oneplus_sm8750 仓库中的配置文件
-            # 需要被复制到 msm-kernel/arch/arm64/configs/vendor/ 目录
-            VENDOR_CONFIGS_DST="msm-kernel/arch/arm64/configs/vendor"
-            mkdir -p "$VENDOR_CONFIGS_DST"
-
-            echo "=== 搜索 OnePlus 配置片段 ==="
-            # 在工作区根目录（android-kernel/）搜索配置文件
-            cd ..
-            echo "当前目录: $(pwd)"
-            echo "搜索 pineapple_oplus_common.config..."
-            find . -name "pineapple_oplus*.config" -not -path "*/.repo/*" 2>/dev/null | head -10
-
-            # 从 modules 仓库的 arch/arm64/configs/vendor/ 复制配置片段
-            # 这些配置文件在 android_kernel_modules_and_devicetree_oneplus_sm8750 仓库中
-            MODULES_VENDOR_CONFIGS="arch/arm64/configs/vendor"
-            if [ -d "$MODULES_VENDOR_CONFIGS" ]; then
-              echo "=== 从 modules 仓库复制配置片段 ==="
-              echo "源目录: $MODULES_VENDOR_CONFIGS/"
-              ls -la "$MODULES_VENDOR_CONFIGS/" 2>/dev/null | head -20
-              # 复制所有配置文件到 msm-kernel 的 vendor 目录
-              cp -v "$MODULES_VENDOR_CONFIGS"/*.config "kernel_platform/$VENDOR_CONFIGS_DST/" 2>/dev/null || true
+            if [[ "$item" =~ ^CONFIG_[A-Z0-9_]+=([ymn]|[0-9]+)$ ]]; then
+              echo "  -> $item"
+              ./scripts/config --file arch/arm64/configs/gki_defconfig --set-val "${item%%=*}" "${item#*=}"
             else
-              echo "警告: 未找到 modules 仓库的 vendor 配置目录: $MODULES_VENDOR_CONFIGS"
-              echo "尝试搜索其他位置..."
-              # 搜索所有 vendor 配置目录
-              find . -type d -name "vendor" -path "*/configs/*" -not -path "*/.repo/*" 2>/dev/null | head -5
+              echo "⚠️ 忽略非法配置项: $item"
             fi
+          done
 
-            # 返回 kernel_platform/ 目录
-            cd kernel_platform
+          echo "📋 禁用常见 OPLUS 相关配置"
+          ./scripts/config --file arch/arm64/configs/gki_defconfig --disable CONFIG_OPLUS_BUG_STABILITY || true
+          ./scripts/config --file arch/arm64/configs/gki_defconfig --disable CONFIG_OPLUS_FEATURE_DEXOPT_STRATEGY || true
+          ./scripts/config --file arch/arm64/configs/gki_defconfig --disable CONFIG_OPLUS_FEATURE_THEIA || true
+          ./scripts/config --file arch/arm64/configs/gki_defconfig --disable CONFIG_OPLUS_BINDER_STRATEGY || true
+          ./scripts/config --file arch/arm64/configs/gki_defconfig --disable CONFIG_OPLUS_FEATURE_HEALTHINFO || true
 
-            echo "=== 检查 vendor 配置目录 ==="
-            ls -la "$VENDOR_CONFIGS_DST/" 2>/dev/null | head -20 || echo "目录不存在或为空"
+      - name: "🔨 Build Kernel Image + Modules"
+        run: |
+          set -euo pipefail
+          cd kernel_workspace/kernel_platform/common
 
-            # 检查关键文件是否存在，如果不存在则创建空文件
-            if [ ! -f "$VENDOR_CONFIGS_DST/pineapple_oplus_common.config" ]; then
-              echo "警告: 未找到 pineapple_oplus_common.config，创建空文件..."
-              touch "$VENDOR_CONFIGS_DST/pineapple_oplus_common.config"
-              echo "✓ 已创建空的 pineapple_oplus_common.config"
+          echo "🔧 查找 Clang 工具链"
+          CLANG_BIN=$(find ../prebuilts/clang -type f -name clang 2>/dev/null | head -1 || true)
+          if [ -n "$CLANG_BIN" ]; then
+            CLANG_DIR=$(dirname "$CLANG_BIN")
+            echo "✅ 使用预编译 Clang: $CLANG_DIR"
+          else
+            CLANG_DIR="/usr/bin"
+            echo "⚠️ 使用系统 Clang"
+          fi
+
+          if [ -d "$CLANG_DIR" ]; then
+            export PATH="$CLANG_DIR:$PATH"
+          fi
+
+          export KBUILD_BUILD_USER="OnePlus"
+          export KBUILD_BUILD_HOST="GitHub-Actions"
+          export ARCH=arm64
+          export LLVM=1
+          export CC="ccache clang"
+          export LD=ld.lld
+          export HOSTCC=clang
+          export HOSTCXX=clang++
+          export CROSS_COMPILE="aarch64-linux-gnu-"
+          export KCFLAGS="${KCFLAGS:-} -Wno-error"
+
+          echo "📋 编译器版本"
+          clang --version | head -1
+          ld.lld --version 2>/dev/null || true
+          aarch64-linux-gnu-gcc --version | head -1 || true
+
+          echo ""
+          echo "🔧 配置内核"
+          make O=out ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE="$CROSS_COMPILE" gki_defconfig
+
+          echo ""
+          echo "🔧 编译 Image + Modules"
+          make -j"$(nproc --all)" O=out ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE="$CROSS_COMPILE" Image modules 2>&1 | tee ../build.log
+
+      - name: "🔧 Build DTB"
+        run: |
+          set -euo pipefail
+          cd kernel_workspace/kernel_platform/common
+
+          echo "🔧 编译设备树"
+          make -j"$(nproc --all)" O=out ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE="aarch64-linux-gnu-" dtbs 2>&1 | tee -a ../build.log
+
+      - name: "🧱 Build GKI artifacts"
+        if: env.BUILD_MODE == 'gki' || env.BUILD_MODE == 'both'
+        run: |
+          set -euo pipefail
+          cd kernel_workspace/kernel_platform/common
+
+          echo "🔧 生成 GKI 官方风格产物"
+          mkdir -p ../Final-Image/gki/{boot,dtbs,modules,system_dlkm,vendor_dlkm,bootconfig,logs}
+
+          if [ -f out/arch/arm64/boot/Image ]; then
+            cp out/arch/arm64/boot/Image ../Final-Image/gki/boot/Image
+            cp out/arch/arm64/boot/Image ../Final-Image/gki/boot/Image.raw || true
+          fi
+
+          if [ -f out/arch/arm64/boot/Image.gz ]; then
+            cp out/arch/arm64/boot/Image.gz ../Final-Image/gki/boot/Image.gz
+          fi
+
+          if [ -f out/arch/arm64/boot/Image.lz4 ]; then
+            cp out/arch/arm64/boot/Image.lz4 ../Final-Image/gki/boot/Image.lz4
+          fi
+
+          if [ -f out/.config ]; then
+            cp out/.config ../Final-Image/gki/kernel.config
+          fi
+
+          if [ -f out/vmlinux ]; then
+            cp out/vmlinux ../Final-Image/gki/vmlinux
+          fi
+
+          if [ -d out/arch/arm64/boot/dts ]; then
+            find out/arch/arm64/boot/dts -name '*.dtb' -exec cp {} ../Final-Image/gki/dtbs/ \; 2>/dev/null
+            find out/arch/arm64/boot/dts -name '*.dtbo' -exec cp {} ../Final-Image/gki/dtbs/ \; 2>/dev/null
+          fi
+
+          if [ -d out ]; then
+            find out -name '*.ko' -type f -exec cp {} ../Final-Image/gki/modules/ \; 2>/dev/null
+          fi
+
+          if [ -d out/system_dlkm ]; then
+            cp -r out/system_dlkm ../Final-Image/gki/system_dlkm
+          fi
+
+          if [ -d out/vendor_dlkm ]; then
+            cp -r out/vendor_dlkm ../Final-Image/gki/vendor_dlkm
+          fi
+
+          if [ -f out/bootconfig ]; then
+            cp out/bootconfig ../Final-Image/gki/bootconfig/bootconfig
+          fi
+
+          if [ -f out/arch/arm64/boot/boot.img ]; then
+            cp out/arch/arm64/boot/boot.img ../Final-Image/gki/boot/boot.img
+          fi
+
+          if [ -f ../build.log ]; then
+            cp ../build.log ../Final-Image/gki/logs/build.log
+          fi
+
+          if [ -f ../Final-Image/Image ]; then
+            DTB_FILE=$(find ../Final-Image/dts -type f -name '*.dtb' 2>/dev/null | head -1 || true)
+            if [ -n "$DTB_FILE" ]; then
+              python3 -c "import os, subprocess; from pathlib import Path; root = Path('/home/runner/work/android_kernel_oneplus_sm8750/android_kernel_oneplus_sm8750/kernel_workspace/kernel_platform'); img = root / 'Final-Image' / 'Image'; dtb = next((p for p in (root / 'Final-Image' / 'dts').glob('*.dtb')), None); out = root / 'Final-Image' / 'gki' / 'boot' / 'boot.img'; cmd = ['python3','-m','mkbootimg','--kernel',str(img),'--ramdisk','/dev/null','--output',str(out),'--pagesize','4096','--dtb',str(dtb),'--header_version','4','--os_version','15','--os_patch_level','2026-08-09','--cmdline','console=ttyMSM0,115200n8 earlycon']; subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) if img.exists() and dtb is not None else None" 2>/dev/null || true
+            fi
+          fi
+
+          if [ -f ../Final-Image/gki/boot/boot.img ]; then
+            echo "📦 boot.img 已生成" > ../Final-Image/gki/logs/bootimg_status.txt
+          else
+            echo "⚠️ boot.img 未生成" > ../Final-Image/gki/logs/bootimg_status.txt
+          fi
+
+          if [ -f ../Final-Image/gki/boot/boot.img ]; then
+            echo "✅ boot.img 已生成"
+          fi
+
+          echo "✅ GKI 产物已收集"
+
+      - name: "📦 Collect Build Artifacts"
+        run: |
+          set -euo pipefail
+          cd kernel_workspace/kernel_platform
+
+          mkdir -p Final-Image/dts Final-Image/modules
+
+          if [ -f common/out/arch/arm64/boot/Image ]; then
+            cp common/out/arch/arm64/boot/Image Final-Image/Image
+            echo "✅ Image copied"
+          fi
+
+          if [ -f common/out/arch/arm64/boot/Image.gz ]; then
+            cp common/out/arch/arm64/boot/Image.gz Final-Image/Image.gz
+          fi
+
+          if [ -f common/out/arch/arm64/boot/Image.lz4 ]; then
+            cp common/out/arch/arm64/boot/Image.lz4 Final-Image/Image.lz4
+          fi
+
+          if [ -d common/out/arch/arm64/boot/dts ]; then
+            find common/out/arch/arm64/boot/dts -name '*.dtb' -exec cp {} Final-Image/dts/ \; 2>/dev/null
+            find common/out/arch/arm64/boot/dts -name '*.dtbo' -exec cp {} Final-Image/dts/ \; 2>/dev/null
+          fi
+
+          if [ -d common/out ]; then
+            find common/out -name '*.ko' -type f -exec cp {} Final-Image/modules/ \; 2>/dev/null
+          fi
+
+          if [ -f common/out/.config ]; then
+            cp common/out/.config Final-Image/kernel.config
+          fi
+
+          if [ -f common/out/vmlinux ]; then
+            cp common/out/vmlinux Final-Image/vmlinux
+          fi
+
+          echo "📦 Final artifacts"
+          find Final-Image -maxdepth 2 -type f | sort | sed 's#^# - #' || true
+
+      - name: "🧱 Build boot.img (best effort)"
+        run: |
+          set -euo pipefail
+          cd kernel_workspace/kernel_platform
+
+          if [ -f Final-Image/Image ]; then
+            DTB_FILE=$(find Final-Image/dts -type f -name '*.dtb' 2>/dev/null | head -1 || true)
+            MKBOOTIMG_PY=$(find . -path '*/mkbootimg.py' 2>/dev/null | head -1 || true)
+            if [ -n "$MKBOOTIMG_PY" ]; then
+              mkdir -p Final-Image/boot
+              python3 "$MKBOOTIMG_PY" \
+                --kernel Final-Image/Image \
+                --ramdisk /dev/null \
+                --output Final-Image/boot.img \
+                --pagesize 4096 \
+                --dtb "$DTB_FILE" \
+                --header_version 4 \
+                --os_version 15 \
+                --os_patch_level 2026-08-09 \
+                --cmdline 'console=ttyMSM0,115200n8 earlycon' || true
             else
-              echo "✓ 找到 pineapple_oplus_common.config"
+              echo "⚠️ mkbootimg.py not found; skipping boot.img"
             fi
-
-            # 修复 walt_halt.c 中未保护的 OnePlus 符号引用
-            # OnePlus 源码不完整，kernel/oplus_cpu/ 目录未开源
-            # 方案：在文件中添加缺失符号的 stub 定义，不修改原有代码逻辑
-            WALT_HALT_FILE="msm-kernel/kernel/sched/walt/walt_halt.c"
-            if [ -f "$WALT_HALT_FILE" ]; then
-              echo "=== 修复 walt_halt.c 中未保护的 OnePlus 符号引用 ==="
-              
-              awk '/^struct cpumask __cpu_partial_halt_mask;$/{print;print "#ifndef CONFIG_OPLUS_ADD_CORE_CTRL_MASK";print "static DEFINE_PER_CPU(int[MAX_PAUSE_TYPE], oplus_cur_pause_client);";print "struct cpumask cur_cpus_halt_mask;";print "struct cpumask cur_cpus_phalt_mask;";print "static inline void sa_corectl_systrace_c(void) {}";print "#endif";next}1' "$WALT_HALT_FILE" > /tmp/walt_halt_fixed.c
-              mv /tmp/walt_halt_fixed.c "$WALT_HALT_FILE"
-              
-              echo "✓ 已修复 walt_halt.c"
-            fi
-
-            # 修复 cpufreq_walt.c 中 waltgov_get_util 未使用函数警告
-            # OnePlus 源码中该函数在某些配置下未被调用，但 -Werror 导致编译失败
-            CPUFREQ_WALT_FILE="msm-kernel/kernel/sched/walt/cpufreq_walt.c"
-            if [ -f "$CPUFREQ_WALT_FILE" ]; then
-              echo "=== 修复 cpufreq_walt.c 中 waltgov_get_util 未使用警告 ==="
-              sed -i 's/^static unsigned long waltgov_get_util/static __maybe_unused unsigned long waltgov_get_util/' "$CPUFREQ_WALT_FILE"
-              echo "✓ 已修复 cpufreq_walt.c"
-            fi
-
-            # 调整 target 路径：从 //kernel_platform/... 改为 //...
-            # 因为现在工作区是 kernel_platform/，不是 android-kernel/
-            TARGET="${{ steps.params.outputs.bazel_target }}"
-            TARGET=$(echo "$TARGET" | sed 's|//kernel_platform/|//|')
-
-            echo "=== 工作目录: $(pwd) ==="
-            echo "=== 编译 target: $TARGET ==="
-            echo ""
-
-            # 编译
-            tools/bazel build --config=fast "$TARGET"
-
-          elif [ -f "kernel_platform/build_with_bazel.py" ]; then
-            echo "=== 使用 build_with_bazel.py 编译 ==="
-            cd kernel_platform
-            python3 build_with_bazel.py --target ${{ steps.params.outputs.build_target }}
           else
-            echo "错误: 找不到 Bazel 编译工具"
-            echo "搜索所有 bazel 相关文件:"
-            find . -name "*bazel*" -type f 2>/dev/null | head -10
-            exit 1
+            echo "⚠️ Image not found; skipping boot.img"
           fi
 
-          echo ""
-          echo "=== 编译完成 ==="
-          ccache -s 2>/dev/null || true
+      - name: "📤 Upload Kernel Artifacts"
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel_pad2pro_repo_build
+          path: |
+            kernel_workspace/kernel_platform/Final-Image/
+            kernel_workspace/kernel_platform/Final-Image/gki/
+          retention-days: 7
 
-      # ============================================================
-      # 8. 验证内核配置
-      #    检查自定义配置是否生效
-      # ============================================================
-      - name: Verify kernel config
-        if: always()
-        run: |
-          cd ${{ env.WORKSPACE }}
-          CUSTOM_CONFIGS="${{ github.event.inputs.custom_configs }}"
-
-          echo "=== 查找编译生成的 .config ==="
-          find . -name ".config" -not -path "*/.repo/*" 2>/dev/null | head -10
-          echo ""
-
-          # 找到实际的 .config 文件
-          CONFIG_FILE=$(find . -name ".config" -not -path "*/.repo/*" \
-            -not -path "*/cache/*" 2>/dev/null | head -1)
-
-          if [ -z "$CONFIG_FILE" ]; then
-            echo "警告: 未找到 .config 文件"
-            # 搜索 defconfig
-            echo "搜索 defconfig 文件:"
-            find . -name "*.config" -path "*/out/*" -not -path "*/.repo/*" 2>/dev/null | head -10
-            CONFIG_FILE=$(find . -name "defconfig" -path "*/out/*" -not -path "*/.repo/*" 2>/dev/null | head -1)
-          fi
-
-          if [ -n "$CONFIG_FILE" ]; then
-            echo "=== .config 文件: $CONFIG_FILE ==="
-            echo "文件大小: $(wc -l < "$CONFIG_FILE") 行"
-            echo ""
-
-            # 检查自定义配置
-            if [ -n "$CUSTOM_CONFIGS" ]; then
-              echo "=== 检查自定义配置是否生效 ==="
-              echo "$CUSTOM_CONFIGS" | tr ',;' '\n\n' | sed '/^[[:space:]]*$/d' | while IFS='=' read -r key val; do
-                [ -z "$key" ] && continue
-                key=$(echo "$key" | tr -d '[:space:]')
-                val=$(echo "$val" | tr -d '[:space:]')
-                echo "  检查: $key=$val"
-                grep -i "${key#CONFIG_}" "$CONFIG_FILE" 2>/dev/null | head -3 || \
-                  echo "    未找到 $key"
-              done
-            fi
-
-            echo ""
-            echo "=== 关键命名空间配置 ==="
-            grep -i "PID_NS\|IPC_NS\|USER_NS\|NET_NS\|UTS_NS\|NAMESPACES" "$CONFIG_FILE" 2>/dev/null || \
-              echo "未找到命名空间相关配置"
-            
-            echo ""
-            echo "=== 内核模块配置 (LKM 模式) ==="
-            echo "--- 模块支持 ---"
-            grep -i "CONFIG_MODULES\|CONFIG_MODULE_UNLOAD\|CONFIG_MODULE_FORCE_LOAD\|CONFIG_MODULE_FORCE_UNLOAD" "$CONFIG_FILE" 2>/dev/null || \
-              echo "未找到模块支持配置"
-            
-            echo ""
-            echo "--- 模块压缩 ---"
-            grep -i "CONFIG_MODULE_COMPRESS\|CONFIG_MODULE_COMPRESS_GZIP\|CONFIG_MODULE_COMPRESS_XZ\|CONFIG_MODULE_COMPRESS_ZSTD" "$CONFIG_FILE" 2>/dev/null || \
-              echo "未找到模块压缩配置"
-            
-            echo ""
-            echo "--- 模块签名 ---"
-            grep -i "CONFIG_MODULE_SIG\|CONFIG_MODULE_SIG_FORCE\|CONFIG_MODULE_SIG_ALL" "$CONFIG_FILE" 2>/dev/null || \
-              echo "未找到模块签名配置"
-            
-            echo ""
-            echo "--- GKI 相关配置 ---"
-            grep -i "CONFIG_GKI\|CONFIG_ANDROID\|CONFIG_KMI" "$CONFIG_FILE" 2>/dev/null | head -10 || \
-              echo "未找到 GKI 相关配置"
-            
-            echo ""
-            echo "=== WiFi/蓝牙相关配置 ==="
-            echo "--- 无线网络核心 ---"
-            grep -i "CONFIG_WIRELESS\|CONFIG_NET\|CONFIG_MAC80211\|CONFIG_CFG80211" "$CONFIG_FILE" 2>/dev/null | head -10 || \
-              echo "未找到无线网络核心配置"
-            
-            echo ""
-            echo "--- WiFi 驱动 ---"
-            grep -i "CONFIG_WLAN\|CONFIG_ATH\|CONFIG_BRCM\|CONFIG_IWL\|CONFIG_RTL\|CONFIG_MT76\|CONFIG_WCNSS" "$CONFIG_FILE" 2>/dev/null | head -15 || \
-              echo "未找到 WiFi 驱动配置"
-            
-            echo ""
-            echo "--- 蓝牙核心 ---"
-            grep -i "CONFIG_BT\|CONFIG_BLUETOOTH" "$CONFIG_FILE" 2>/dev/null | head -10 || \
-              echo "未找到蓝牙核心配置"
-            
-            echo ""
-            echo "--- 蓝牙驱动 ---"
-            grep -i "CONFIG_BT_HCIUART\|CONFIG_BT_HCIBTUSB\|CONFIG_BT_HCIBTSDIO\|CONFIG_BT_HCIQCA" "$CONFIG_FILE" 2>/dev/null | head -10 || \
-              echo "未找到蓝牙驱动配置"
-            
-            echo ""
-            echo "--- 固件加载 ---"
-            grep -i "CONFIG_FW_LOADER\|CONFIG_EXTRA_FIRMWARE" "$CONFIG_FILE" 2>/dev/null | head -5 || \
-              echo "未找到固件加载配置"
-            
-            echo ""
-            echo "--- 射频/无线设备 ---"
-            grep -i "CONFIG_RFKILL\|CONFIG_REGULATOR" "$CONFIG_FILE" 2>/dev/null | head -5 || \
-              echo "未找到射频/无线设备配置"
-          else
-            echo "错误: 未找到任何 .config 文件"
-          fi
-
-      # ============================================================
-      # 9. 收集编译产物
-      #    Bazel 输出可能在 out/bazel/output/ 或 kernel_platform/out/
-      # ============================================================
-      - name: Collect build artifacts
-        if: always()
-        run: |
-          cd ${{ env.WORKSPACE }}
-          mkdir -p artifacts
-
-          echo "=== 查找产物目录 ==="
-          find . -type d \( -name "dist" -o -name "output" \) 2>/dev/null | grep -v ".repo" | head -20
-          echo ""
-
-          # 搜索所有可能的产物目录
-          # Bazel 工作区是 kernel_platform/，所以输出可能在：
-          # - kernel_platform/out/ (Bazel 输出)
-          # - kernel_platform/bazel-out/ (Bazel 符号链接)
-          # - out/ (顶层输出)
-          DIST_DIR=""
-          for candidate in \
-            kernel_platform/out/bazel/output \
-            kernel_platform/out \
-            kernel_platform/bazel-out \
-            out/bazel/output \
-            out/dist \
-            kernel_platform/out/dist \
-            out/android15-6.6/dist; do
-            if [ -d "$candidate" ] && [ "$(ls -A $candidate 2>/dev/null)" ]; then
-              DIST_DIR="$candidate"
-              break
-            fi
-          done
-
-          # 回退：搜索任意 dist/output 目录
-          if [ -z "$DIST_DIR" ]; then
-            DIST_DIR=$(find . \( -name "dist" -o -name "output" \) -type d 2>/dev/null | \
-              grep -v ".repo" | head -1)
-          fi
-          if [ -z "$DIST_DIR" ]; then
-            echo "未找到产物目录"
-            DIST_DIR="out"
-          fi
-
-          echo "=== 产物目录: $DIST_DIR ==="
-          ls -lh "$DIST_DIR/" 2>/dev/null | head -40
-          echo ""
-
-          # 复制内核镜像
-          echo "=== 收集内核镜像 ==="
-          for f in Image Image.gz Image.lz4 Image.gz-dtb vmlinux vmlinux.symvers System.map; do
-            find "$DIST_DIR" -name "$f" -exec cp -v {} artifacts/ \; 2>/dev/null
-          done
-
-          # 复制模块信息
-          for f in modules.builtin modules.builtin.modinfo modules.order modules.dep; do
-            find "$DIST_DIR" -name "$f" -exec cp -v {} artifacts/ \; 2>/dev/null
-          done
-
-          # 复制 .config
-          find . -name ".config" -not -path "*/.repo/*" \
-            -exec cp -v {} artifacts/kernel.config \; 2>/dev/null
-
-          # 复制内核模块
-          echo "=== 收集内核模块 (*.ko) ==="
-          MODULE_COUNT=$(find "$DIST_DIR" -name "*.ko" 2>/dev/null | wc -l)
-          echo "找到 $MODULE_COUNT 个内核模块"
-          
-          # 诊断 WiFi/蓝牙相关模块
-          echo ""
-          echo "=== WiFi/蓝牙相关模块 ==="
-          echo "--- WiFi 模块 ---"
-          find "$DIST_DIR" -name "*.ko" 2>/dev/null | grep -iE "wlan|wifi|cfg80211|mac80211|qca|wcn|ath|brcm|iwl|rtl|mt76" | head -20 || echo "未找到 WiFi 模块"
-          
-          echo ""
-          echo "--- 蓝牙模块 ---"
-          find "$DIST_DIR" -name "*.ko" 2>/dev/null | grep -iE "bluetooth|bt|hci" | head -20 || echo "未找到蓝牙模块"
-          
-          echo ""
-          echo "--- 射频/无线模块 ---"
-          find "$DIST_DIR" -name "*.ko" 2>/dev/null | grep -iE "rfkill|regulator|wireless" | head -10 || echo "未找到射频/无线模块"
-          
-          # 检查模块依赖关系
-          echo ""
-          echo "=== 模块依赖关系 ==="
-          if [ -f "$DIST_DIR/modules.dep" ]; then
-            echo "--- WiFi/蓝牙模块依赖 ---"
-            grep -iE "wlan|wifi|bluetooth|bt|qca|wcn" "$DIST_DIR/modules.dep" 2>/dev/null | head -20 || echo "未找到相关依赖"
-          else
-            echo "modules.dep 文件不存在"
-          fi
-          
-          # 检查内置模块
-          echo ""
-          echo "=== 内置模块检查 ==="
-          if [ -f "$DIST_DIR/modules.builtin" ]; then
-            echo "--- 内置的 WiFi/蓝牙模块 ---"
-            grep -iE "wlan|wifi|bluetooth|bt|cfg80211|mac80211" "$DIST_DIR/modules.builtin" 2>/dev/null | head -20 || echo "未找到内置的 WiFi/蓝牙模块"
-          else
-            echo "modules.builtin 文件不存在"
-          fi
-          
-          if [ "$MODULE_COUNT" -gt 0 ] && [ "$MODULE_COUNT" -le 500 ]; then
-            find "$DIST_DIR" -name "*.ko" -exec cp -v {} artifacts/ \; 2>/dev/null
-          elif [ "$MODULE_COUNT" -gt 500 ]; then
-            find "$DIST_DIR" -name "*.ko" | tar -czf artifacts/kernel-modules.tar.gz -T -
-          fi
-
-          # 复制分发包
-          find "$DIST_DIR" -name "*.tar.gz" -exec cp -v {} artifacts/ \; 2>/dev/null
-
-          # 复制 boot.img 等
-          for f in boot-gki.img boot.img vendor_boot.img vbmeta.img system_dlkm.img; do
-            find . -name "$f" -not -path "*/.repo/*" -exec cp -v {} artifacts/ \; 2>/dev/null
-          done
-
-          echo ""
-          echo "=== 最终产物列表 ==="
-          ls -lh artifacts/ 2>/dev/null
-          echo "总大小: $(du -sh artifacts/ 2>/dev/null | cut -f1)"
-
-      # ============================================================
-      # 9. 上传编译产物
-      # ============================================================
-      - name: Upload kernel artifacts
+      - name: "📤 Upload Build Log"
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-${{ steps.params.outputs.build_target }}-${{ steps.params.outputs.manifest_name }}
-          path: ${{ env.WORKSPACE }}/artifacts/
-          retention-days: 14
-          compression-level: 6
-
-      # ============================================================
-      # 10. 编译摘要
-      # ============================================================
-      - name: Generate build summary
-        if: always()
-        run: |
-          echo "## 内核编译摘要" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| 项目 | 值 |" >> $GITHUB_STEP_SUMMARY
-          echo "|------|-----|" >> $GITHUB_STEP_SUMMARY
-          echo "| Manifest | \`${{ steps.params.outputs.manifest_file }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| 编译目标 | \`${{ steps.params.outputs.build_target }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Bazel target | \`${{ steps.params.outputs.bazel_target }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| 架构 | aarch64 |" >> $GITHUB_STEP_SUMMARY
-          echo "| 运行时间 | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |" >> $GITHUB_STEP_SUMMARY
-
-          CUSTOM_CONFIGS="${{ github.event.inputs.custom_configs }}"
-          if [ -n "$CUSTOM_CONFIGS" ]; then
-            echo "| 自定义配置 | 已应用 |" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### 自定义内核配置" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            echo "$CUSTOM_CONFIGS" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-          else
-            echo "| 自定义配置 | 无（默认配置） |" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          ARTIFACTS_DIR="${{ env.WORKSPACE }}/artifacts"
-          if [ -d "$ARTIFACTS_DIR" ] && [ "$(ls -A $ARTIFACTS_DIR 2>/dev/null)" ]; then
-            echo "### 产物列表" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "| 文件 | 大小 |" >> $GITHUB_STEP_SUMMARY
-            echo "|------|------|" >> $GITHUB_STEP_SUMMARY
-            ls -lh "$ARTIFACTS_DIR/" | tail -n +2 | \
-              awk '{print "| `" $NF "` | " $5 " |"}' >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "总大小: **$(du -sh $ARTIFACTS_DIR | cut -f1)**" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "### ⚠️ 编译失败或无产物" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "请检查 Actions 日志排查错误。" >> $GITHUB_STEP_SUMMARY
-          fi
+          name: build_log_pad2pro_repo_build
+          path: kernel_workspace/kernel_platform/build.log
+          retention-days: 3
