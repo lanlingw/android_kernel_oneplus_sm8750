@@ -1,31 +1,28 @@
-name: OnePlus Pad 2 Pro
+name: OnePlus Pad 2 Pro (Official - Bazel)
 
 on:
   workflow_dispatch:
     inputs:
       CUSTOM_CONFIG:
-        description: "自定义内核配置选项 (逗号分隔，格式: CONFIG_XXX=y,CONFIG_YYY=y)"
+        description: "自定义内核配置选项 (逗号分隔)"
         required: false
         type: string
         default: "CONFIG_SYSVIPC=y,CONFIG_POSIX_MQUEUE=y,CONFIG_IPC_NS=y,CONFIG_PID_NS=y"
 
 jobs:
   build:
-    name: Build GKI Kernel (android15-6.6)
+    name: Build Kernel via Bazel/Kleaf
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 480
 
     env:
-      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
-      CCACHE_NOHASHDIR: "true"
-      CCACHE_HARDLINK: "true"
       CCACHE_MAXSIZE: 8G
 
     steps:
       - name: "🚀 Maximize Build Space"
         uses: easimon/maximize-build-space@master
         with:
-          root-reserve-mb: 16384
+          root-reserve-mb: 24576
           temp-reserve-mb: 8192
           remove-dotnet: 'true'
           remove-android: 'true'
@@ -35,68 +32,69 @@ jobs:
       - name: "📦 Cache & Install Dependencies"
         uses: awalsh128/cache-apt-pkgs-action@latest
         with:
-          packages: python3 git curl ccache libelf-dev build-essential flex bison libssl-dev libncurses-dev liblz4-tool zlib1g-dev libxml2-utils rsync unzip gawk dos2unix bc clang lld llvm
+          packages: python3 git curl ccache libelf-dev build-essential flex bison libssl-dev libncurses-dev zlib1g-dev rsync unzip gawk dos2unix bc openjdk-17-jdk
           execute_install_scripts: true
 
-      - name: "🔧 Install newer LLVM/Clang"
+      - name: "📥 Install Repo Tool"
         run: |
-          echo "📋 检查可用 LLVM 版本..."
-          apt-cache search llvm | grep -E "llvm-[0-9]+" | sort
-          echo "📋 检查可用 Clang 版本..."
-          apt-cache search clang | grep -E "clang-[0-9]+" | sort
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
+          chmod a+x ~/repo
+          sudo mv ~/repo /usr/local/bin/repo
+          echo "✅ repo 工具安装完成"
 
-          echo "🔧 安装 LLVM 15/18..."
-          sudo apt-get install -y llvm-15 llvm-15-dev clang-15 lld-15 2>/dev/null || \
-          sudo apt-get install -y llvm-18 llvm-18-dev clang-18 lld-18 2>/dev/null || \
-          echo "⚠️ 无法安装预编译 LLVM，使用系统默认"
-
-          echo "📋 当前编译器版本:"
-          clang --version | head -1
-          ld.lld --version | head -1
-          which llvm-objcopy 2>/dev/null || echo "llvm-objcopy 未找到"
-          which llvm-strip 2>/dev/null || echo "llvm-strip 未找到"
-
-      - name: "🔍 Test Network Access"
+      - name: "📥 Init & Sync All Repos"
         run: |
-          echo "📋 测试 GitHub Actions 网络访问..."
-          echo "--- github.com ---"
-          curl -sI --connect-timeout 10 https://github.com 2>&1 | head -3
+          echo "📋 初始化仓库清单..."
+          mkdir kernel_workspace && cd kernel_workspace
+
+          repo init -u https://github.com/OnePlusOSS/kernel_manifest.git \
+                    -b oneplus/sm8750 \
+                    -m oneplus_pad_2_pro_b.xml \
+                    --depth=1
+
+          echo "🔄 同步所有仓库 (约 35 个)..."
+          repo sync -c -j$(nproc --all) --no-tags --no-clone-bundle --force-sync
+
+          echo "✅ 仓库同步完成"
           echo ""
-          echo "--- codelinaro.org ---"
-          curl -sI --connect-timeout 10 https://git.codelinaro.org 2>&1 | head -3
+          echo "📂 工作区结构:"
+          ls -la
           echo ""
-          echo "--- 尝试 clone codelinaro 测试仓库 ---"
-          git ls-remote https://git.codelinaro.org/clo/la/kernel/prebuilts/build-tools.git 2>&1 | head -5 || echo "❌ 无法访问"
+          echo "📂 kernel_platform:"
+          ls -la kernel_platform/
+          echo ""
+          echo "📂 prebuilts/clang:"
+          ls kernel_platform/prebuilts/clang/host/linux-x86/ 2>/dev/null | head -10
+          echo ""
+          echo "📂 build:"
+          ls kernel_platform/build/ 2>/dev/null
 
-      - name: "📥 Clone All Kernel Repos"
+      - name: "🔍 Check Build Dependencies"
         run: |
-          echo "⬇️ 克隆 OnePlus 官方 GKI 内核源码..."
-          git clone --depth=1 -b oneplus/sm8750_b_16.0.0_pad_2_pro \
-            https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8750.git \
-            kernel/common
-          echo "✅ common 克隆完成"
+          cd kernel_workspace
 
-          echo "⬇️ 克隆 msm-kernel..."
-          git clone --depth=1 -b oneplus/sm8750_b_16.0.0_pad_2_pro \
-            https://github.com/OnePlusOSS/android_kernel_oneplus_sm8750.git \
-            kernel/msm-kernel
-          echo "✅ msm-kernel 克隆完成"
-
-          echo "⬇️ 克隆 modules & devicetree..."
-          git clone --depth=1 -b oneplus/sm8750_b_16.0.0_pad_2_pro \
-            https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8750.git \
-            kernel/msm-kernel/android
-          echo "✅ modules 克隆完成"
-
-          echo "⬇️ 克隆 codelinaro 预编译工具链..."
-          git clone --depth=1 https://git.codelinaro.org/clo/la/kernelplatform/prebuilts-master/clang/host/linux-x86.git \
-            kernel/prebuilts/clang/host/linux-x86 2>&1 || echo "⚠️ clang 克隆失败"
+          echo "📋 检查关键文件和目录..."
+          echo ""
+          echo "--- build/build.sh ---"
+          ls -la kernel_platform/build/build.sh 2>/dev/null || echo "⚠️ build.sh 不存在"
 
           echo ""
-          echo "📂 目录结构:"
-          ls -la kernel/
+          echo "--- build/kernel/kleaf ---"
+          ls kernel_platform/build/kernel/kleaf/ 2>/dev/null | head -10 || echo "⚠️ kleaf 不存在"
 
-      - name: "⚙️ Setup Cache Env"
+          echo ""
+          echo "--- build/config.sh ---"
+          ls kernel_platform/build/config.sh 2>/dev/null || echo "⚠️ config.sh 不存在"
+
+          echo ""
+          echo "--- msm-kernel build.config.msm.sun ---"
+          ls kernel_platform/msm-kernel/build.config.msm.sun 2>/dev/null || echo "⚠️ 不存在"
+
+          echo ""
+          echo "--- defconfig ---"
+          ls kernel_platform/msm-kernel/arch/arm64/configs/ 2>/dev/null | head -10
+
+      - name: "🔧 Setup Cache Env"
         run: |
           echo "CCACHE_DIR=$HOME/.ccache_pad2pro" >> $GITHUB_ENV
           mkdir -p "$HOME/.ccache_pad2pro"
@@ -105,9 +103,9 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ runner.os }}-pad2pro-${{ github.run_id }}
+          key: ccache-bazel-${{ runner.os }}-pad2pro-${{ github.run_id }}
           restore-keys: |
-            ccache-${{ runner.os }}-pad2pro
+            ccache-bazel-${{ runner.os }}-pad2pro
 
       - name: "⚙️ Initialize ccache"
         run: |
@@ -115,123 +113,174 @@ jobs:
           ccache -M ${{ env.CCACHE_MAXSIZE }}
           ccache -s
 
-      - name: "🔨 Build GKI Kernel"
+      - name: "🔧 Apply Custom Kernel Config"
         run: |
-          cd kernel
+          cd kernel_workspace/kernel_platform
 
-          echo "🔧 设置编译环境..."
+          echo "📋 添加自定义内核配置..."
+          echo '${{ github.event.inputs.CUSTOM_CONFIG }}' | tr ',' '\n' | grep -v '^$' >> msm-kernel/arch/arm64/configs/gki_defconfig
+
+          echo "✅ 已追加的配置:"
+          echo '${{ github.event.inputs.CUSTOM_CONFIG }}' | tr ',' '\n' | grep -v '^$'
+
+          echo ""
+          echo "📋 检查 gki_defconfig 末尾:"
+          tail -10 msm-kernel/arch/arm64/configs/gki_defconfig
+
+      - name: "🔨 Build Kernel via Bazel/Kleaf"
+        run: |
+          cd kernel_workspace/kernel_platform
+
+          echo "🔧 设置环境变量..."
           export KBUILD_BUILD_USER="OnePlus"
           export KBUILD_BUILD_HOST="GitHub-Actions"
-          export PATH="/usr/lib/ccache:$PATH"
 
-          echo "📋 编译器版本:"
-          clang --version | head -2
-          ld.lld --version 2>/dev/null || ld.lld-15 --version 2>/dev/null || echo "⚠️ ld.lld 未找到"
-
-          echo ""
-          echo "🔧 步骤1: 生成 gki_defconfig..."
-          make -j$(nproc --all) \
-            LLVM=1 \
-            ARCH=arm64 \
-            CC="ccache clang" \
-            LD=ld.lld \
-            O=out \
-            gki_defconfig 2>&1 | tail -10
-
-          echo ""
-          echo "🔧 步骤2: 添加自定义内核配置..."
-          echo '${{ github.event.inputs.CUSTOM_CONFIG }}' | tr ',' '\n' | grep -v "^$" >> out/.config
-          echo "📋 已追加的自定义配置:"
-          echo '${{ github.event.inputs.CUSTOM_CONFIG }}' | tr ',' '\n' | grep -v "^$"
-          make -j$(nproc --all) \
-            LLVM=1 \
-            ARCH=arm64 \
-            CC="ccache clang" \
-            LD=ld.lld \
-            O=out \
-            olddefconfig 2>&1 | tail -5
-
-          echo ""
-          echo "🔧 步骤3: 编译内核..."
-          make -j$(nproc --all) \
-            LLVM=1 \
-            ARCH=arm64 \
-            CC="ccache clang" \
-            LD=ld.lld \
-            O=out \
-            2>&1 | tee build.log
-
-          BUILD_EXIT=${PIPESTATUS[0]}
-
-          echo ""
-          ccache -s
-          echo ""
-
-          if [ -f "out/arch/arm64/boot/Image" ]; then
-            echo "✅ 编译成功!"
-            echo "📦 Image 大小: $(du -h out/arch/arm64/boot/Image | cut -f1)"
-            echo "📦 Image.gz 大小: $(du -h out/arch/arm64/boot/Image.gz 2>/dev/null | cut -f1 || echo 'N/A')"
+          echo "🔧 检查构建系统..."
+          if [ -f "build/build.sh" ]; then
+            echo "✅ 使用 build/build.sh (Kleaf)"
+            BUILD_CMD="build/build.sh"
+          elif [ -f "msm-kernel/build_with_bazel.py" ]; then
+            echo "✅ 使用 build_with_bazel.py"
+            BUILD_CMD="python3 msm-kernel/build_with_bazel.py"
           else
-            echo "❌ 编译失败 (exit code: $BUILD_EXIT)"
-            echo "=== 错误信息 ==="
-            grep -E "(Error|error:|FAILED|fatal)" build.log | tail -30
-            echo ""
-            echo "=== 最后 30 行日志 ==="
-            tail -30 build.log
+            echo "❌ 找不到构建系统"
+            ls build/ 2>/dev/null
             exit 1
           fi
 
           echo ""
-          echo "📋 检查自定义内核配置是否生效..."
-          IFS=',' read -ra CFG_ARRAY <<< '${{ github.event.inputs.CUSTOM_CONFIG }}'
-          for item in "${CFG_ARRAY[@]}"; do
-            [ -z "$item" ] && continue
-            cfg=$(echo "$item" | cut -d= -f1)
-            result=$(grep "^$cfg=" out/.config 2>/dev/null || grep "# $cfg is not set" out/.config 2>/dev/null || echo "NOT FOUND")
-            echo "  $result"
-          done
+          echo "🔧 开始构建内核..."
+          echo "📋 目标: sun (sm8750) gki"
 
-      - name: "📦 Collect Kernel Images"
-        run: |
-          cd kernel
-
-          mkdir -p Final-Image
-
-          if [ -f "out/arch/arm64/boot/Image" ]; then
-            cp out/arch/arm64/boot/Image Final-Image/Image
-            echo "✅ Image 已复制"
+          if [ "$BUILD_CMD" = "build/build.sh" ]; then
+            # 使用 build.sh (Kleaf)
+            BUILD_BOOT_IMG=1 \
+            BUILD_INITRAMFS=1 \
+            BUILD_VENDOR_DLKM=1 \
+            LTO=thin \
+            build/build.sh \
+              --dist_dir=dist \
+              --target=msm.sun \
+              --variant=gki \
+              2>&1 | tee build.log
+          else
+            # 使用 build_with_bazel.py
+            python3 msm-kernel/build_with_bazel.py \
+              -t sun gki \
+              2>&1 | tee build.log
           fi
 
-          if [ -f "out/arch/arm64/boot/Image.gz" ]; then
-            cp out/arch/arm64/boot/Image.gz Final-Image/Image.gz
-            echo "✅ Image.gz 已复制"
-          fi
-
-          if [ -f "out/arch/arm64/boot/Image.lz4" ]; then
-            cp out/arch/arm64/boot/Image.lz4 Final-Image/Image.lz4
-            echo "✅ Image.lz4 已复制"
-          fi
+          BUILD_EXIT=${PIPESTATUS[0]}
 
           echo ""
-          echo "📋 导出完整内核配置文件..."
-          cp out/.config Final-Image/kernel.config
-          echo "✅ kernel.config 已保存"
+          if [ $BUILD_EXIT -ne 0 ]; then
+            echo "❌ 构建失败"
+            echo "=== 错误信息 ==="
+            grep -E "(Error|error:|FAILED|fatal)" build.log | tail -30
+            echo ""
+            echo "=== 最后 50 行 ==="
+            tail -50 build.log
+            exit 1
+          fi
+
+      - name: "📦 Collect Build Artifacts"
+        run: |
+          cd kernel_workspace/kernel_platform
+
+          echo "📋 搜索构建产物..."
+          echo ""
+
+          echo "--- 搜索 Image ---"
+          find . -name "Image" -path "*/boot/*" -type f 2>/dev/null
+          find dist -name "Image*" -type f 2>/dev/null
+
+          echo ""
+          echo "--- 搜索 DTB ---"
+          find . -name "*.dtb" -type f 2>/dev/null | head -20
+
+          echo ""
+          echo "--- 搜索 .ko ---"
+          find . -name "*.ko" -type f 2>/dev/null | wc -l
+
+          echo ""
+          echo "--- dist 目录 ---"
+          ls -la dist/ 2>/dev/null || echo "dist 目录不存在"
+
+          echo ""
+          mkdir -p Final-Image
+
+          # 复制 Image
+          for img in $(find . -name "Image" -path "*/boot/*" -type f 2>/dev/null | head -1); do
+            cp "$img" Final-Image/Image
+            echo "✅ Image 已复制: $img"
+          done
+
+          # 从 dist 复制
+          if [ -d "dist" ]; then
+            cp dist/Image* Final-Image/ 2>/dev/null || true
+            cp dist/*.ko Final-Image/ 2>/dev/null || true
+            cp dist/*.dtb* Final-Image/ 2>/dev/null || true
+            cp dist/*.dtbo* Final-Image/ 2>/dev/null || true
+          fi
+
+          # 复制 DTB
+          if [ -d "dist/arch/arm64/boot/dts" ]; then
+            mkdir -p Final-Image/dts
+            find dist/arch/arm64/boot/dts -name "*.dtb" -exec cp {} Final-Image/dts/ \; 2>/dev/null
+            find dist/arch/arm64/boot/dts -name "*.dtbo" -exec cp {} Final-Image/dts/ \; 2>/dev/null
+          fi
+
+          # 复制模块
+          KO_COUNT=$(find . -name "*.ko" -type f 2>/dev/null | wc -l)
+          if [ "$KO_COUNT" -gt 0 ]; then
+            mkdir -p Final-Image/modules
+            find . -name "*.ko" -exec cp --parents {} Final-Image/modules/ \; 2>/dev/null
+            echo "✅ 已复制 $KO_COUNT 个 .ko 文件"
+          fi
+
+          # 复制配置文件
+          for cfg in msm-kernel/out/.config common/out/.config; do
+            if [ -f "$cfg" ]; then
+              cp "$cfg" Final-Image/kernel.config
+              echo "✅ kernel.config 已复制"
+              break
+            fi
+          done
 
           echo ""
           echo "📦 最终产物:"
           ls -lh Final-Image/
+          echo ""
+          du -sh Final-Image/* 2>/dev/null
+
+      - name: "📋 Verify Custom Config"
+        run: |
+          cd kernel_workspace/kernel_platform
+
+          if [ -f "Final-Image/kernel.config" ]; then
+            echo "📋 检查自定义内核配置是否生效..."
+            IFS=',' read -ra CFG_ARRAY <<< '${{ github.event.inputs.CUSTOM_CONFIG }}'
+            for item in "${CFG_ARRAY[@]}"; do
+              [ -z "$item" ] && continue
+              cfg=$(echo "$item" | cut -d= -f1)
+              result=$(grep "^$cfg=" Final-Image/kernel.config 2>/dev/null || grep "# $cfg is not set" Final-Image/kernel.config 2>/dev/null || echo "NOT FOUND")
+              echo "  $result"
+            done
+          else
+            echo "⚠️ kernel.config 不存在，跳过检查"
+          fi
 
       - name: "📤 Upload Kernel Artifacts"
         uses: actions/upload-artifact@v7
         with:
-          name: kernel_pad2pro_official
-          path: kernel/Final-Image/*
+          name: kernel_pad2pro_bazel_official
+          path: kernel_workspace/kernel_platform/Final-Image/
           retention-days: 7
 
       - name: "📤 Upload Build Log (on failure)"
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: build_log_pad2pro
-          path: kernel/build.log
+          name: build_log_pad2pro_bazel
+          path: kernel_workspace/kernel_platform/build.log
           retention-days: 3
