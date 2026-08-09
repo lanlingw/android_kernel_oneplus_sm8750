@@ -331,8 +331,9 @@ jobs:
                   content = f.read()
 
               # 在 define_msm_la 调用中添加 defconfig_fragments 参数
+              # 匹配 boot_image_opts(...) 的闭合括号，在其后添加 defconfig_fragments
               content = re.sub(
-                  r'(define_msm_la\(\s*msm_target = target_name,\s*variant = variant,\s*in_tree_module_list = mod_list,\s*boot_image_opts = boot_image_opts\()',
+                  r'(boot_image_opts = boot_image_opts\(\s*earlycon_addr = "[^"]+",\s*kernel_vendor_cmdline_extras = kernel_vendor_cmdline_extras,\s*board_kernel_cmdline_extras = board_kernel_cmdline_extras,\s*board_bootconfig_extras = board_bootconfig_extras,\s*\),)',
                   r'\1\n            defconfig_fragments = ["' + fragment_file + '"],',
                   content
               )
