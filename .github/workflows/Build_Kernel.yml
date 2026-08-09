@@ -147,6 +147,7 @@ jobs:
 
           # 查找 LLVM/Clang 工具链 (clang, ld.lld, llvm-objcopy, llvm-strip 等)
           CLANG_BASE="prebuilts/clang/host/linux-x86"
+          LLD_PATH=""
           if [ -d "$CLANG_BASE" ]; then
             # 查找实际的 clang 目录
             CLANG_DIR=$(find "$CLANG_BASE" -name "clang" -type f -printf '%h\n' 2>/dev/null | head -1)
@@ -163,8 +164,19 @@ jobs:
             fi
           fi
 
-          # 验证 LLD 是否可用
-          which ld.lld 2>/dev/null && echo "✅ ld.lld 在 PATH 中" || echo "⚠️ ld.lld 不在 PATH 中"
+          # 确定 ld.lld 的绝对路径
+          if [ -n "$CLANG_DIR" ] && [ -f "$CLANG_DIR/ld.lld" ]; then
+            LLD_PATH="$CLANG_DIR/ld.lld"
+          elif command -v ld.lld &>/dev/null; then
+            LLD_PATH="$(command -v ld.lld)"
+          fi
+
+          if [ -n "$LLD_PATH" ]; then
+            echo "✅ ld.lld 绝对路径: $LLD_PATH"
+        else
+            echo "❌ ld.lld 未找到，无法继续编译"
+            exit 1
+        fi
 
           # 查找 GCC 交叉编译器
           GCC_BIN=$(find prebuilts/gcc -name "aarch64-linux-gnu-gcc" -type f 2>/dev/null | head -1)
@@ -177,11 +189,16 @@ jobs:
             echo "⚠️ 使用系统 GCC"
           fi
 
-          export PATH="$CLANG_DIR:${LLD_DIR:-/usr/bin}:$GCC_DIR:/usr/lib/ccache:$PATH"
+          # 构建完整 PATH
+          if [ -n "$GCC_DIR" ]; then
+            export PATH="$CLANG_DIR:$GCC_DIR:/usr/lib/ccache:$PATH"
+          else
+            export PATH="$CLANG_DIR:/usr/lib/ccache:$PATH"
+          fi
 
           echo "📋 编译器版本:"
           clang --version | head -1
-          ld.lld --version 2>/dev/null || echo "⚠️ ld.lld 版本检查失败"
+          "$LLD_PATH" --version 2>/dev/null || echo "⚠️ ld.lld 版本检查失败"
           ${CROSS_COMPILE}gcc --version 2>/dev/null | head -1 || echo "⚠️ 交叉编译器未找到"
 
           echo ""
@@ -206,8 +223,8 @@ jobs:
             LLVM=1 \
             ARCH=arm64 \
             CC="ccache clang" \
-            LD=ld.lld \
-            HOSTLD=ld.lld \
+            LD="$LLD_PATH" \
+            HOSTLD="$LLD_PATH" \
             CROSS_COMPILE=${CROSS_COMPILE} \
             O=out \
             gki_defconfig all 2>&1 | tee ../build_common.log
@@ -240,7 +257,7 @@ jobs:
             LLVM=1 \
             ARCH=arm64 \
             CC="ccache clang" \
-            LD=ld.lld \
+            LD="$LLD_PATH" \
             CROSS_COMPILE=${CROSS_COMPILE} \
             O=out \
             dtbs 2>&1 | tee ../build_dtb.log || echo "⚠️ DTB 编译失败，可能需要 vendor 配置"
@@ -251,7 +268,7 @@ jobs:
             LLVM=1 \
             ARCH=arm64 \
             CC="ccache clang" \
-            LD=ld.lld \
+            LD="$LLD_PATH" \
             CROSS_COMPILE=${CROSS_COMPILE} \
             O=out \
             KBUILD_MIXED_TREE=../common \
