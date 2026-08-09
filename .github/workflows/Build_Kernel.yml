@@ -1,25 +1,26 @@
-name: Build OnePlus Pad 2 Pro Kernel (Official)
+name: Build OnePlus Pad 2 Pro Kernel (Repo-based)
 
 on:
   workflow_dispatch:
     inputs:
       CUSTOM_CONFIG:
-        description: "自定义内核配置选项 (逗号分隔)"
+        description: "自定义内核配置项（逗号分隔，例如 CONFIG_SYSVIPC=y,CONFIG_POSIX_MQUEUE=y）"
         required: false
         type: string
         default: "CONFIG_SYSVIPC=y,CONFIG_POSIX_MQUEUE=y,CONFIG_IPC_NS=y,CONFIG_PID_NS=y"
 
 jobs:
   build:
-    name: Build Kernel
+    name: Build OnePlus Pad 2 Pro kernel
     runs-on: ubuntu-latest
     timeout-minutes: 480
 
     env:
       CCACHE_MAXSIZE: 8G
+      CUSTOM_CONFIG: ${{ github.event.inputs.CUSTOM_CONFIG }}
 
     steps:
-      - name: "Maximize Build Space"
+      - name: "🚀 Maximize Build Space"
         uses: easimon/maximize-build-space@master
         with:
           root-reserve-mb: 24576
@@ -29,258 +30,234 @@ jobs:
           remove-haskell: 'true'
           remove-codeql: 'true'
 
-      - name: "Cache & Install Dependencies"
-        uses: awalsh128/cache-apt-pkgs-action@latest
-        with:
-          packages: python3 git curl ccache libelf-dev build-essential flex bison libssl-dev libncurses-dev zlib1g-dev rsync unzip gawk dos2unix bc openjdk-17-jdk
-          execute_install_scripts: true
+      - name: "📦 Install Build Dependencies"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            python3 git curl ccache \
+            build-essential flex bison libssl-dev libncurses-dev zlib1g-dev \
+            rsync unzip gawk dos2unix bc \
+            libelf-dev pkg-config gcc-aarch64-linux-gnu clang lld llvm \
+            openjdk-17-jdk
 
-      - name: "Install Repo Tool"
+      - name: "📥 Install Repo Tool"
         run: |
           curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
           chmod a+x ~/repo
           sudo mv ~/repo /usr/local/bin/repo
+          repo --version
 
-      - name: "Init & Sync All Repos"
+      - name: "📥 Init & Sync Repos"
         run: |
-          mkdir kernel_workspace && cd kernel_workspace
+          set -euo pipefail
+          mkdir -p kernel_workspace
+          cd kernel_workspace
 
           repo init -u https://github.com/OnePlusOSS/kernel_manifest.git \
-                    -b oneplus/sm8750 \
-                    -m oneplus_pad_2_pro_b.xml \
-                    --depth=1
+            -b oneplus/sm8750 \
+            -m oneplus_pad_2_pro_b.xml \
+            --depth=1
 
-          repo sync -c -j$(nproc --all) --no-tags --no-clone-bundle --force-sync
+          repo sync -c -j"$(nproc --all)" --no-tags --no-clone-bundle --force-sync
 
-          echo ""
-          echo "Workspace structure:"
+          echo "📂 workspace" 
           ls -la
           echo ""
-          ls -la kernel_platform/ 2>/dev/null || echo "kernel_platform not found"
+          echo "📂 kernel_platform"
+          ls -la kernel_platform/
+          echo ""
+          echo "📂 common" 
+          ls -la kernel_platform/common/ | head -20
+          echo ""
+          echo "📂 msm-kernel"
+          ls -la kernel_platform/msm-kernel/ | head -20
 
-      - name: "Setup Cache Env"
+      - name: "🔍 Check Build Inputs"
         run: |
-          echo "CCACHE_DIR=$HOME/.ccache_pad2pro" >> $GITHUB_ENV
+          set -euo pipefail
+          cd kernel_workspace/kernel_platform
+
+          test -d common || { echo "common directory missing"; exit 1; }
+          test -d msm-kernel || { echo "msm-kernel directory missing"; exit 1; }
+          test -f common/Makefile || { echo "common/Makefile missing"; exit 1; }
+          test -f msm-kernel/Makefile || { echo "msm-kernel/Makefile missing"; exit 1; }
+
+          echo "✅ common tree ready"
+          echo "✅ msm-kernel tree ready"
+
+      - name: "🔧 Setup ccache"
+        run: |
+          echo "CCACHE_DIR=$HOME/.ccache_pad2pro" >> "$GITHUB_ENV"
           mkdir -p "$HOME/.ccache_pad2pro"
-
-      - name: "Restore ccache"
-        uses: actions/cache@v5
-        with:
-          path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ runner.os }}-pad2pro-${{ github.run_id }}
-          restore-keys: |
-            ccache-${{ runner.os }}-pad2pro
-
-      - name: "Initialize ccache"
-        run: |
-          mkdir -p "${{ env.CCACHE_DIR }}"
-          ccache -M ${{ env.CCACHE_MAXSIZE }}
+          ccache -M "$CCACHE_MAXSIZE"
           ccache -s
 
-      - name: "Apply Custom Kernel Config"
+      - name: "💾 Restore ccache"
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-pad2pro-${{ runner.os }}-${{ github.ref_name }}
+          restore-keys: |
+            ccache-pad2pro-${{ runner.os }}-
+
+      - name: "🔧 Apply Custom Kernel Config"
         run: |
-          cd kernel_workspace/kernel_platform
+          set -euo pipefail
+          cd kernel_workspace/kernel_platform/common
 
-          echo "Applying custom kernel config..."
-          echo '${{ github.event.inputs.CUSTOM_CONFIG }}' | tr ',' '\n' | grep -v '^$' >> msm-kernel/arch/arm64/configs/gki_defconfig
+          echo "📋 解析自定义配置..."
+          IFS=',' read -ra CFG_ARRAY <<< "$CUSTOM_CONFIG"
+          for item in "${CFG_ARRAY[@]}"; do
+            item="${item//[$'\r\n']/}"
+            item="${item#${item%%[![:space:]]*}}"
+            item="${item%${item##*[![:space:]]}}"
+            if [ -z "$item" ]; then
+              continue
+            fi
+            if [[ "$item" =~ ^CONFIG_[A-Z0-9_]+=([ymn]|[0-9]+)$ ]]; then
+              echo "  -> $item"
+              ./scripts/config --file arch/arm64/configs/gki_defconfig --set-val "${item%%=*}" "${item#*=}"
+            else
+              echo "⚠️ 忽略非法配置项: $item"
+            fi
+          done
 
-          echo "Custom config added:"
-          echo '${{ github.event.inputs.CUSTOM_CONFIG }}' | tr ',' '\n' | grep -v '^$'
+          echo "📋 禁用常见 OPLUS 相关配置"
+          ./scripts/config --file arch/arm64/configs/gki_defconfig --disable CONFIG_OPLUS_BUG_STABILITY || true
+          ./scripts/config --file arch/arm64/configs/gki_defconfig --disable CONFIG_OPLUS_FEATURE_DEXOPT_STRATEGY || true
+          ./scripts/config --file arch/arm64/configs/gki_defconfig --disable CONFIG_OPLUS_FEATURE_THEIA || true
+          ./scripts/config --file arch/arm64/configs/gki_defconfig --disable CONFIG_OPLUS_BINDER_STRATEGY || true
+          ./scripts/config --file arch/arm64/configs/gki_defconfig --disable CONFIG_OPLUS_FEATURE_HEALTHINFO || true
 
-      - name: "Build Kernel + Modules"
+      - name: "🔨 Build Kernel Image + Modules"
         run: |
-          cd kernel_workspace/kernel_platform
+          set -euo pipefail
+          cd kernel_workspace/kernel_platform/common
+
+          echo "🔧 查找 Clang 工具链"
+          CLANG_BIN=$(find ../prebuilts/clang -type f -name clang 2>/dev/null | head -1 || true)
+          if [ -n "$CLANG_BIN" ]; then
+            CLANG_DIR=$(dirname "$CLANG_BIN")
+            echo "✅ 使用预编译 Clang: $CLANG_DIR"
+          else
+            CLANG_DIR="/usr/bin"
+            echo "⚠️ 使用系统 Clang"
+          fi
+
+          if [ -d "$CLANG_DIR" ]; then
+            export PATH="$CLANG_DIR:$PATH"
+          fi
 
           export KBUILD_BUILD_USER="OnePlus"
           export KBUILD_BUILD_HOST="GitHub-Actions"
+          export ARCH=arm64
+          export LLVM=1
+          export CC="ccache clang"
+          export LD=ld.lld
+          export HOSTCC=clang
+          export HOSTCXX=clang++
+          export CROSS_COMPILE="aarch64-linux-gnu-"
+          export KCFLAGS="${KCFLAGS:-} -Wno-error"
 
-          # Find Clang
-          CLANG_BIN=$(find prebuilts/clang -name "clang" -type f 2>/dev/null | head -1)
-          if [ -n "$CLANG_BIN" ]; then
-            CLANG_DIR=$(dirname "$CLANG_BIN")
-            echo "Using prebuilt Clang: $CLANG_DIR"
-          else
-            CLANG_DIR="/usr/bin"
-            echo "Using system Clang"
-          fi
-
-          # Create ld.lld symlink if needed
-          if [ ! -f "$CLANG_DIR/ld.lld" ] && [ -f "$CLANG_DIR/ld.lld-18" ]; then
-            ln -sf ld.lld-18 "$CLANG_DIR/ld.lld"
-            echo "Created ld.lld -> ld.lld-18 symlink"
-          fi
-
-          # Set LLD path
-          LLD_PATH=""
-          if [ -f "$CLANG_DIR/ld.lld" ]; then
-            LLD_PATH="$CLANG_DIR/ld.lld"
-          elif command -v ld.lld &>/dev/null; then
-            LLD_PATH="$(command -v ld.lld)"
-          fi
-
-          if [ -z "$LLD_PATH" ]; then
-            echo "ERROR: ld.lld not found"
-            exit 1
-          fi
-          echo "Using LLD: $LLD_PATH"
-
-          # Find GCC
-          GCC_BIN=$(find prebuilts/gcc -name "aarch64-linux-gnu-gcc" -type f 2>/dev/null | head -1)
-          if [ -n "$GCC_BIN" ]; then
-            GCC_DIR=$(dirname "$GCC_BIN")
-            export CROSS_COMPILE="$(pwd)/$GCC_DIR/aarch64-linux-gnu-"
-            echo "Using prebuilt GCC: $CROSS_COMPILE"
-          else
-            export CROSS_COMPILE="aarch64-linux-gnu-"
-            echo "Using system GCC"
-          fi
-
-          export PATH="$CLANG_DIR:${GCC_DIR:-/usr/bin}:/usr/lib/ccache:$PATH"
-
-          echo ""
-          echo "Compiler versions:"
+          echo "📋 编译器版本"
           clang --version | head -1
-          "$LLD_PATH" --version 2>/dev/null | head -1 || echo "LLD version check failed"
-          ${CROSS_COMPILE}gcc --version 2>/dev/null | head -1 || echo "Cross compiler not found"
-
-          # Build common kernel
-          echo ""
-          echo "Building common kernel (GKI)..."
-          cd common
-
-          # Disable OPLUS closed-source drivers to avoid build issues
-          ./scripts/config --file arch/arm64/configs/gki_defconfig \
-            --disable CONFIG_OPLUS_BUG_STABILITY \
-            --disable CONFIG_OPLUS_FEATURE_DEXOPT_STRATEGY \
-            --disable CONFIG_OPLUS_FEATURE_THEIA \
-            --disable CONFIG_OPLUS_BINDER_STRATEGY 2>/dev/null || true
-
-          make -j$(nproc --all) \
-            LLVM=1 \
-            ARCH=arm64 \
-            CC="ccache clang" \
-            LD="$LLD_PATH" \
-            HOSTLD="$LLD_PATH" \
-            CROSS_COMPILE=${CROSS_COMPILE} \
-            O=out \
-            gki_defconfig all 2>&1 | tee ../build_common.log
-
-          BUILD_EXIT=${PIPESTATUS[0]}
-
-          if [ $BUILD_EXIT -ne 0 ]; then
-            echo ""
-            echo "BUILD FAILED"
-            grep -E "(Error|error:|FAILED|fatal)" ../build_common.log | tail -20
-            exit 1
-          fi
-
-          if [ -f "out/arch/arm64/boot/Image" ]; then
-            echo ""
-            echo "Build successful!"
-            echo "Image size: $(du -h out/arch/arm64/boot/Image | cut -f1)"
-          fi
-
-          # Build device tree
-          echo ""
-          echo "Building device tree (DTB)..."
-          cd ../msm-kernel
-
-          make -j$(nproc --all) \
-            LLVM=1 \
-            ARCH=arm64 \
-            CC="ccache clang" \
-            LD="$LLD_PATH" \
-            CROSS_COMPILE=${CROSS_COMPILE} \
-            O=out \
-            dtbs 2>&1 | tee ../build_dtb.log || echo "DTB build may have issues"
-
-          # Build modules
-          echo ""
-          echo "Building kernel modules..."
-          make -j$(nproc --all) \
-            LLVM=1 \
-            ARCH=arm64 \
-            CC="ccache clang" \
-            LD="$LLD_PATH" \
-            CROSS_COMPILE=${CROSS_COMPILE} \
-            O=out \
-            modules 2>&1 | tee ../build_modules.log || echo "Module build may have issues"
+          ld.lld --version 2>/dev/null || true
+          aarch64-linux-gnu-gcc --version | head -1 || true
 
           echo ""
-          ccache -s
+          echo "🔧 配置内核"
+          make O=out ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE="$CROSS_COMPILE" gki_defconfig
 
-      - name: "Collect Build Artifacts"
+          echo ""
+          echo "🔧 编译 Image + Modules"
+          make -j"$(nproc --all)" O=out ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE="$CROSS_COMPILE" Image modules 2>&1 | tee ../build.log
+
+      - name: "🔧 Build DTB"
         run: |
+          set -euo pipefail
+          cd kernel_workspace/kernel_platform/common
+
+          echo "🔧 编译设备树"
+          make -j"$(nproc --all)" O=out ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE="aarch64-linux-gnu-" dtbs 2>&1 | tee -a ../build.log
+
+      - name: "📦 Collect Build Artifacts"
+        run: |
+          set -euo pipefail
           cd kernel_workspace/kernel_platform
 
-          mkdir -p Final-Image
+          mkdir -p Final-Image/dts Final-Image/modules
 
-          # Copy kernel image
-          if [ -f "common/out/arch/arm64/boot/Image" ]; then
+          if [ -f common/out/arch/arm64/boot/Image ]; then
             cp common/out/arch/arm64/boot/Image Final-Image/Image
-            echo "Image copied ($(du -h common/out/arch/arm64/boot/Image | cut -f1))"
+            echo "✅ Image copied"
           fi
 
-          if [ -f "common/out/arch/arm64/boot/Image.gz" ]; then
+          if [ -f common/out/arch/arm64/boot/Image.gz ]; then
             cp common/out/arch/arm64/boot/Image.gz Final-Image/Image.gz
           fi
 
-          if [ -f "common/out/arch/arm64/boot/Image.lz4" ]; then
+          if [ -f common/out/arch/arm64/boot/Image.lz4 ]; then
             cp common/out/arch/arm64/boot/Image.lz4 Final-Image/Image.lz4
           fi
 
-          # Copy DTB
-          if [ -d "msm-kernel/out/arch/arm64/boot/dts" ]; then
-            mkdir -p Final-Image/dts
-            find msm-kernel/out/arch/arm64/boot/dts -name "*.dtb" -exec cp {} Final-Image/dts/ \; 2>/dev/null
-            find msm-kernel/out/arch/arm64/boot/dts -name "*.dtbo" -exec cp {} Final-Image/dts/ \; 2>/dev/null
-            echo "DTB/DTBO copied ($(find Final-Image/dts -type f 2>/dev/null | wc -l) files)"
+          if [ -d common/out/arch/arm64/boot/dts ]; then
+            find common/out/arch/arm64/boot/dts -name '*.dtb' -exec cp {} Final-Image/dts/ \; 2>/dev/null
+            find common/out/arch/arm64/boot/dts -name '*.dtbo' -exec cp {} Final-Image/dts/ \; 2>/dev/null
           fi
 
-          # Copy modules
-          KO_COUNT=$(find common/out msm-kernel/out -name "*.ko" -type f 2>/dev/null | wc -l)
-          if [ "$KO_COUNT" -gt 0 ]; then
-            mkdir -p Final-Image/modules
-            find common/out msm-kernel/out -name "*.ko" -exec cp {} Final-Image/modules/ \; 2>/dev/null
-            echo "$KO_COUNT .ko files copied"
+          if [ -d common/out ]; then
+            find common/out -name '*.ko' -type f -exec cp {} Final-Image/modules/ \; 2>/dev/null
           fi
 
-          # Copy config
-          if [ -f "common/out/.config" ]; then
+          if [ -f common/out/.config ]; then
             cp common/out/.config Final-Image/kernel.config
-            echo "kernel.config copied"
           fi
 
-          echo ""
-          echo "Final artifacts:"
-          ls -lh Final-Image/
+          if [ -f common/out/vmlinux ]; then
+            cp common/out/vmlinux Final-Image/vmlinux
+          fi
 
-      - name: "Verify Custom Config"
+          echo "📦 Final artifacts"
+          find Final-Image -maxdepth 2 -type f | sort | sed 's#^# - #' || true
+
+      - name: "🧱 Build boot.img (best effort)"
         run: |
+          set -euo pipefail
           cd kernel_workspace/kernel_platform
 
-          if [ -f "Final-Image/kernel.config" ]; then
-            echo "Checking custom config..."
-            IFS=',' read -ra CFG_ARRAY <<< '${{ github.event.inputs.CUSTOM_CONFIG }}'
-            for item in "${CFG_ARRAY[@]}"; do
-              [ -z "$item" ] && continue
-              cfg=$(echo "$item" | cut -d= -f1)
-              result=$(grep "^$cfg=" Final-Image/kernel.config 2>/dev/null || grep "# $cfg is not set" Final-Image/kernel.config 2>/dev/null || echo "NOT FOUND")
-              echo "  $result"
-            done
+          if [ -f Final-Image/Image ]; then
+            DTB_FILE=$(find Final-Image/dts -type f -name '*.dtb' 2>/dev/null | head -1 || true)
+            MKBOOTIMG_PY=$(find . -path '*/mkbootimg.py' 2>/dev/null | head -1 || true)
+            if [ -n "$MKBOOTIMG_PY" ]; then
+              mkdir -p Final-Image/boot
+              python3 "$MKBOOTIMG_PY" \
+                --kernel Final-Image/Image \
+                --ramdisk /dev/null \
+                --output Final-Image/boot.img \
+                --pagesize 4096 \
+                --dtb "$DTB_FILE" \
+                --header_version 4 \
+                --os_version 15 \
+                --os_patch_level 2026-08-09 \
+                --cmdline 'console=ttyMSM0,115200n8 earlycon' || true
+            else
+              echo "⚠️ mkbootimg.py not found; skipping boot.img"
+            fi
+          else
+            echo "⚠️ Image not found; skipping boot.img"
           fi
 
-      - name: "Upload Kernel Artifacts"
-        uses: actions/upload-artifact@v7
+      - name: "📤 Upload Kernel Artifacts"
+        uses: actions/upload-artifact@v4
         with:
-          name: kernel_pad2pro_official
+          name: kernel_pad2pro_repo_build
           path: kernel_workspace/kernel_platform/Final-Image/
           retention-days: 7
 
-      - name: "Upload Build Log (on failure)"
-        if: failure()
-        uses: actions/upload-artifact@v7
+      - name: "📤 Upload Build Log"
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          name: build_log_pad2pro
-          path: kernel_workspace/kernel_platform/build_common.log
+          name: build_log_pad2pro_repo_build
+          path: kernel_workspace/kernel_platform/build.log
           retention-days: 3
