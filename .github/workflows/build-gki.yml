@@ -49,7 +49,7 @@ jobs:
             build-essential flex bison libssl-dev libncurses-dev zlib1g-dev \
             rsync unzip gawk dos2unix bc \
             libelf-dev pkg-config gcc-aarch64-linux-gnu clang lld llvm \
-            openjdk-17-jdk android-tools-fsutils
+            openjdk-17-jdk android-sdk-libsparse-utils
 
       - name: "📥 Install Repo Tool"
         run: |
@@ -111,7 +111,7 @@ jobs:
           restore-keys: |
             ccache-pad2pro-${{ runner.os }}-
 
-      - name: "🔨 Build Kernel Image (drivers built-in, no DTB)"
+      - name: "🔨 Build Kernel per BUILD_MODE"
         run: |
           set -euo pipefail
           cd kernel_workspace/kernel_platform/common
@@ -140,40 +140,74 @@ jobs:
           ld.lld --version 2>/dev/null || true
           aarch64-linux-gnu-gcc --version | head -1 || true
 
-          echo ""
-          echo "🔧 使用目标配置: $KERNEL_DEFCONFIG"
-          make O=out ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE="$CROSS_COMPILE" "$KERNEL_DEFCONFIG"
+          build_one() {
+            local ODIR="$1"
+            local DEFCONFIG="$2"
+            local BAKE="$3"
+            local LOG="$4"
 
-          if [ -n "${CUSTOM_CONFIG// }" ]; then
-            echo "📋 应用自定义配置: $CUSTOM_CONFIG"
-            IFS=',' read -ra CFG_ITEMS <<< "$CUSTOM_CONFIG"
-            for item in "${CFG_ITEMS[@]}"; do
-              item="${item//[$'\r\n']/}"
-              item="${item#${item%%[![:space:]]*}}"
-              item="${item%${item##*[![:space:]]}}"
-              if [ -z "$item" ]; then
-                continue
+            echo ""
+            echo "=== [$DEFCONFIG] O=$ODIR 开始构建 ==="
+            rm -rf "$ODIR"
+            make O="$ODIR" ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ \
+                 CROSS_COMPILE="$CROSS_COMPILE" "$DEFCONFIG"
+
+            if [ "$BAKE" = "1" ]; then
+              if [ -n "${CUSTOM_CONFIG// }" ]; then
+                echo "📋 应用自定义配置: $CUSTOM_CONFIG"
+                IFS=',' read -ra CFG_ITEMS <<< "$CUSTOM_CONFIG"
+                for item in "${CFG_ITEMS[@]}"; do
+                  item="${item//[$'\r\n']/}"
+                  item="${item#${item%%[![:space:]]*}}"
+                  item="${item%${item##*[![:space:]]}}"
+                  if [ -z "$item" ]; then
+                    continue
+                  fi
+                  if [[ "$item" =~ ^CONFIG_[A-Z0-9_]+=([ymn]|[0-9]+)$ ]]; then
+                    name="${item%%=*}"
+                    value="${item#*=}"
+                    echo "  -> $name=$value"
+                    ./scripts/config --file "$ODIR/.config" --set-val "$name" "$value"
+                  else
+                    echo "⚠️ 忽略非法配置项: $item"
+                  fi
+                done
               fi
-              if [[ "$item" =~ ^CONFIG_[A-Z0-9_]+=([ymn]|[0-9]+)$ ]]; then
-                name="${item%%=*}"
-                value="${item#*=}"
-                echo "  -> $name=$value"
-                ./scripts/config --file out/.config --set-val "$name" "$value"
-              else
-                echo "⚠️ 忽略非法配置项: $item"
-              fi
-            done
-            yes '' | make O=out ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE="$CROSS_COMPILE" olddefconfig
-          fi
+              echo "🔧 将设备驱动内置进内核（CONFIG_*=m -> CONFIG_*=y）"
+              sed -i 's/^\(CONFIG_[A-Z0-9_]*\)=m$/\1=y/' "$ODIR/.config"
+            fi
 
-          echo ""
-          echo "🔧 将设备驱动内置进内核（CONFIG_*=m -> CONFIG_*=y）"
-          sed -i 's/^\(CONFIG_[A-Z0-9_]*\)=m$/\1=y/' out/.config
-          yes '' | make O=out ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE="$CROSS_COMPILE" olddefconfig
+            yes '' | make O="$ODIR" ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ \
+                 CROSS_COMPILE="$CROSS_COMPILE" olddefconfig
 
-          echo ""
-          echo "🔧 开始编译 Image（驱动已内置，不编译设备树）"
-          make -j"$(nproc --all)" O=out ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE="$CROSS_COMPILE" Image 2>&1 | tee ../build.log
+            echo ""
+            echo "🔧 编译 Image ..."
+            make -j"$(nproc --all)" O="$ODIR" ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ \
+                 CROSS_COMPILE="$CROSS_COMPILE" Image 2>&1 | tee "$LOG"
+
+            if [ "$BAKE" = "0" ]; then
+              echo ""
+              echo "🔧 编译 GKI 附加镜像 (Image.gz / Image.lz4) ..."
+              make -j"$(nproc --all)" O="$ODIR" ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ \
+                   CROSS_COMPILE="$CROSS_COMPILE" Image.gz Image.lz4 2>&1 | tee -a "$LOG"
+            fi
+
+            echo "=== [$DEFCONFIG] 构建完成 ==="
+          }
+
+          case "$BUILD_MODE" in
+            gki)
+              build_one out_gki gki_defconfig 0 ../build-gki.log
+              ;;
+            both)
+              build_one out "$KERNEL_DEFCONFIG" 1 ../build-kernelonly.log
+              build_one out_gki gki_defconfig 0 ../build-gki.log
+              ;;
+            *)
+              echo "BUILD_MODE=$BUILD_MODE → 按 kernel-only 处理"
+              build_one out "$KERNEL_DEFCONFIG" 1 ../build-kernelonly.log
+              ;;
+          esac
 
       - name: "📦 Collect Build Artifacts"
         if: always()
@@ -181,82 +215,80 @@ jobs:
           set -euo pipefail
           cd kernel_workspace/kernel_platform 2>/dev/null || { mkdir -p kernel_workspace/kernel_platform/Final-Image; exit 0; }
 
-          mkdir -p Final-Image/{boot,kernel,dtbs,modules,bootconfig,logs}
-          mkdir -p Final-Image/gki/{boot,dtbs,modules,system_dlkm,vendor_dlkm,bootconfig,logs,vendor_boot}
+          collect_kernel() {
+            local SRC="$1"
+            local DEST="$2"
+            local LOG="$3"
 
-          if [ -f common/out/arch/arm64/boot/Image ]; then
-            cp common/out/arch/arm64/boot/Image Final-Image/kernel/Image
-            cp common/out/arch/arm64/boot/Image Final-Image/gki/boot/Image
-          fi
+            if [ -f "$SRC/arch/arm64/boot/Image" ]; then
+              cp "$SRC/arch/arm64/boot/Image" "$DEST/Image"
+            fi
+            if [ -f "$SRC/arch/arm64/boot/Image.gz" ]; then
+              cp "$SRC/arch/arm64/boot/Image.gz" "$DEST/Image.gz"
+            fi
+            if [ -f "$SRC/arch/arm64/boot/Image.lz4" ]; then
+              cp "$SRC/arch/arm64/boot/Image.lz4" "$DEST/Image.lz4"
+            fi
+            if [ -f "$SRC/.config" ]; then
+              cp "$SRC/.config" "$DEST/kernel.config"
+            fi
+            if [ -f "$SRC/vmlinux" ]; then
+              cp "$SRC/vmlinux" "$DEST/vmlinux"
+            fi
+            if [ -s "$LOG" ]; then
+              cp "$LOG" "$DEST/build.log"
+            fi
+            find "$SRC" -name '*.ko' -type f -exec cp {} "$DEST/modules/" \; 2>/dev/null || true
 
-          if [ -f common/out/.config ]; then
-            cp common/out/.config Final-Image/kernel/kernel.config
-            cp common/out/.config Final-Image/gki/boot/kernel.config
-          fi
+            if command -v mkbootimg >/dev/null && [ -f "$DEST/Image" ]; then
+              local DTB_FILE
+              DTB_FILE=$(find "$SRC" -name '*.dtb' -path '*boot/dts*' | head -n 1 || true)
+              if [ -n "$DTB_FILE" ]; then
+                mkbootimg --kernel "$DEST/Image" \
+                  --ramdisk /dev/null \
+                  --output "$DEST/boot.img" \
+                  --pagesize 4096 \
+                  --base 0x10000000 \
+                  --dtb "$DTB_FILE" \
+                  --header_version 4 \
+                  --os_version 16 \
+                  --os_patch_level 2026-08-09 \
+                  --cmdline 'console=ttyMSM0,115200n8 earlycon' || true
+              else
+                mkbootimg --kernel "$DEST/Image" \
+                  --ramdisk /dev/null \
+                  --output "$DEST/boot.img" \
+                  --pagesize 4096 \
+                  --base 0x10000000 \
+                  --header_version 4 \
+                  --os_version 16 \
+                  --os_patch_level 2026-08-09 \
+                  --cmdline 'console=ttyMSM0,115200n8 earlycon' || true
+              fi
+            elif [ -f "$DEST/Image" ]; then
+              cp "$DEST/Image" "$DEST/boot.img"
+              echo "mkbootimg unavailable; using raw Image as boot.img" > "$DEST/bootimg_status.txt"
+            fi
+          }
 
-          if [ -f common/out/vmlinux ]; then
-            cp common/out/vmlinux Final-Image/vmlinux
-          fi
+          mkdir -p Final-Image/modules Final-Image/gki/modules
 
-          if [ -f common/out/bootconfig ]; then
-            cp common/out/bootconfig Final-Image/bootconfig/bootconfig
-            cp common/out/bootconfig Final-Image/gki/bootconfig/bootconfig
-          else
-            echo "bootconfig not generated by kernel build" > Final-Image/bootconfig/README.txt
-            echo "bootconfig not generated by kernel build" > Final-Image/gki/bootconfig/README.txt
-          fi
-
-          if [ -d common/out/arch/arm64/boot/dts ]; then
-            find common/out/arch/arm64/boot/dts -name '*.dtb' -o -name '*.dtbo' | while read -r f; do cp "$f" Final-Image/dtbs/; cp "$f" Final-Image/gki/dtbs/; done
-          else
-            echo "DTB not built (drivers are built-in)" > Final-Image/dtbs/README.txt
-            echo "DTB not built (drivers are built-in)" > Final-Image/gki/dtbs/README.txt
-          fi
-
-          if [ -d common/out ]; then
-            find common/out -name '*.ko' -type f -exec cp {} Final-Image/modules/ \; 2>/dev/null || true
-            find common/out -name '*.ko' -type f -exec cp {} Final-Image/gki/modules/ \; 2>/dev/null || true
-          fi
-
-          if [ -d common/out/system_dlkm ]; then
-            cp -r common/out/system_dlkm Final-Image/gki/system_dlkm
-          else
-            echo "system_dlkm not generated by kernel build" > Final-Image/gki/system_dlkm/README.txt
-          fi
-
-          if [ -d common/out/vendor_dlkm ]; then
-            cp -r common/out/vendor_dlkm Final-Image/gki/vendor_dlkm
-          else
-            echo "vendor_dlkm not generated by kernel build" > Final-Image/gki/vendor_dlkm/README.txt
-          fi
-
-          if command -v mkbootimg >/dev/null && [ -f Final-Image/kernel/Image ]; then
-            mkbootimg --kernel Final-Image/kernel/Image \
-              --ramdisk /dev/null \
-              --output Final-Image/boot/boot.img \
-              --pagesize 4096 \
-              --base 0x10000000 \
-              --header_version 4 \
-              --os_version 16 \
-              --os_patch_level 2026-08-09 \
-              --cmdline 'console=ttyMSM0,115200n8 earlycon'
-            cp Final-Image/boot/boot.img Final-Image/gki/boot/boot.img
-          elif [ -f Final-Image/kernel/Image ]; then
-            cp Final-Image/kernel/Image Final-Image/boot/boot.img
-            cp Final-Image/kernel/Image Final-Image/gki/boot/boot.img
-            echo "mkbootimg missing or dtb required; using raw Image as boot.img" > Final-Image/logs/bootimg_status.txt
-            echo "mkbootimg missing or dtb required; using raw Image as boot.img" > Final-Image/gki/logs/bootimg_status.txt
-          fi
-
-          echo "vendor_boot partition image is not created by this workflow" > Final-Image/gki/vendor_boot/README.txt
-
-          if [ -f build.log ]; then
-            cp build.log Final-Image/logs/build.log
-            cp build.log Final-Image/gki/logs/build.log
-          fi
+          case "$BUILD_MODE" in
+            gki)
+              collect_kernel common/out_gki Final-Image/gki ../build-gki.log
+              # No kernel-only artifacts in this mode; root is empty by design
+              ;;
+            both)
+              collect_kernel common/out Final-Image ../build-kernelonly.log
+              collect_kernel common/out_gki Final-Image/gki ../build-gki.log
+              ;;
+            *)
+              collect_kernel common/out Final-Image ../build-kernelonly.log
+              ;;
+          esac
 
           echo "📦 Artifact layout"
-          find Final-Image -maxdepth 4 -type f | sort | sed 's#^# - #' || true
+          find Final-Image -maxdepth 2 -type f | sort | sed 's#^# - #' || true
 
       - name: "📤 Upload Kernel Artifacts"
         if: always()
@@ -271,12 +303,15 @@ jobs:
         if: always()
         run: |
           mkdir -p kernel_workspace/kernel_platform
-          touch kernel_workspace/kernel_platform/build.log
+          touch kernel_workspace/kernel_platform/build-kernelonly.log
+          touch kernel_workspace/kernel_platform/build-gki.log
 
       - name: "📤 Upload Build Log"
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: build_log_pad2pro_repo_build
-          path: kernel_workspace/kernel_platform/build.log
+          path: |
+            kernel_workspace/kernel_platform/build-kernelonly.log
+            kernel_workspace/kernel_platform/build-gki.log
           retention-days: 3
