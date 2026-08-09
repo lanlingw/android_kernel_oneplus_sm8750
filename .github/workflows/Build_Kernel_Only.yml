@@ -86,7 +86,21 @@ jobs:
             gki_defconfig 2>&1 | tail -10
 
           echo ""
-          echo "🔧 步骤2: 编译内核..."
+          echo "🔧 步骤2: 添加自定义内核配置..."
+          echo "CONFIG_SYSVIPC=y" >> out/.config
+          echo "CONFIG_POSIX_MQUEUE=y" >> out/.config
+          echo "CONFIG_IPC_NS=y" >> out/.config
+          echo "CONFIG_PID_NS=y" >> out/.config
+          make -j$(nproc --all) \
+            LLVM=1 \
+            ARCH=arm64 \
+            CC="ccache clang" \
+            LD=ld.lld \
+            O=out \
+            olddefconfig 2>&1 | tail -5
+
+          echo ""
+          echo "🔧 步骤3: 编译内核..."
           make -j$(nproc --all) \
             LLVM=1 \
             ARCH=arm64 \
