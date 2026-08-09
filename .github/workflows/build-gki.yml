@@ -465,19 +465,13 @@ jobs:
 
             # 修复 walt_halt.c 中未保护的 OnePlus 符号引用
             # OnePlus 源码不完整，kernel/oplus_cpu/ 目录未开源
-            # 用 sed 直接修改，避免 heredoc 在 YAML 中的问题
+            # 方案：在文件中添加缺失符号的 stub 定义，不修改原有代码逻辑
             WALT_HALT_FILE="msm-kernel/kernel/sched/walt/walt_halt.c"
             if [ -f "$WALT_HALT_FILE" ]; then
               echo "=== 修复 walt_halt.c 中未保护的 OnePlus 符号引用 ==="
               
-              sed -i '/pause_client_state = per_cpu_ptr(oplus_cur_pause_client/i\#ifdef CONFIG_OPLUS_ADD_CORE_CTRL_MASK' "$WALT_HALT_FILE"
-              sed -i '/halt_cpu_state->client_vote_mask\[type\] &= ~client;/{n;s/}/}\n#endif/}' "$WALT_HALT_FILE"
-              
-              sed -i '/int \*pause_client_state;/i\#ifdef CONFIG_OPLUS_ADD_CORE_CTRL_MASK' "$WALT_HALT_FILE"
-              sed -i '/struct halt_cpu_state \*halt_cpu_state;/{n;s/int \*pause_client_state;/#endif\n\tint *pause_client_state;/}' "$WALT_HALT_FILE"
-              
-              sed -i 's|^\tcpumask_copy(&cur_cpus_halt_mask, cpu_halt_mask);|\t#ifdef CONFIG_OPLUS_ADD_CORE_CTRL_MASK\n\tcpumask_copy(\&cur_cpus_halt_mask, cpu_halt_mask);|' "$WALT_HALT_FILE"
-              sed -i 's|^\tsa_corectl_systrace_c();|\tsa_corectl_systrace_c();\n\t#endif|' "$WALT_HALT_FILE"
+              awk '/^struct cpumask __cpu_partial_halt_mask;$/{print;print "#ifndef CONFIG_OPLUS_ADD_CORE_CTRL_MASK";print "static DEFINE_PER_CPU(int[MAX_PAUSE_TYPE], oplus_cur_pause_client);";print "struct cpumask cur_cpus_halt_mask;";print "struct cpumask cur_cpus_phalt_mask;";print "static inline void sa_corectl_systrace_c(void) {}";print "#endif";next}1' "$WALT_HALT_FILE" > /tmp/walt_halt_fixed.c
+              mv /tmp/walt_halt_fixed.c "$WALT_HALT_FILE"
               
               echo "✓ 已修复 walt_halt.c"
             fi
