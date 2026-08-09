@@ -1,37 +1,39 @@
-name: Build GKI Kernel (OnePlus SM8750)
+name: Build OnePlus Pad 2 Pro Kernel (Official Kleaf)
 
 on:
   workflow_dispatch:
     inputs:
-      BUILD_MODE:
-        description: "选择构建模式"
-        required: true
-        type: choice
-        default: "kernel-only"
-        options:
-          - "kernel-only"
-          - "gki"
-          - "both"
+      TARGET:
+        description: "Kleaf target（官方 README：sun）"
+        required: false
+        type: string
+        default: "sun"
+      VARIANT:
+        description: "Kleaf variant（官方 README：perf）"
+        required: false
+        type: string
+        default: "perf"
       CUSTOM_CONFIG:
-        description: "自定义内核配置项（逗号分隔，例如 CONFIG_SYSVIPC=y,CONFIG_POSIX_MQUEUE=y）"
+        description: "可选：追加到 arch/arm64/configs/vendor/sun_perf.config 的自定义配置（逗号分隔，如 CONFIG_SYSVIPC=y）"
         required: false
         type: string
         default: "CONFIG_SYSVIPC=y,CONFIG_POSIX_MQUEUE=y,CONFIG_IPC_NS=y,CONFIG_PID_NS=y"
 
 jobs:
   build:
-    name: Build OnePlus Pad 2 Pro kernel
+    name: Build ${{ inputs.TARGET }} ${{ inputs.VARIANT }}
     runs-on: ubuntu-latest
     timeout-minutes: 480
 
     env:
-      CCACHE_MAXSIZE: 8G
-      CUSTOM_CONFIG: ${{ github.event.inputs.CUSTOM_CONFIG }}
-      BUILD_MODE: ${{ github.event.inputs.BUILD_MODE }}
-      KERNEL_DEFCONFIG: sun_le_defconfig
+      TARGET: ${{ inputs.TARGET }}
+      VARIANT: ${{ inputs.VARIANT }}
+      CUSTOM_CONFIG: ${{ inputs.CUSTOM_CONFIG }}
+      WORKSPACE: kernel_workspace
+      ACK_DIR: kernel_workspace/kernel_platform
 
     steps:
-      - name: "🚀 Maximize Build Space"
+      - name: "Maximize Build Space"
         uses: easimon/maximize-build-space@master
         with:
           root-reserve-mb: 24576
@@ -41,29 +43,35 @@ jobs:
           remove-haskell: 'true'
           remove-codeql: 'true'
 
-      - name: "📦 Install Build Dependencies"
+      - name: "Install Build Dependencies"
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            python3 git curl ccache \
-            build-essential flex bison libssl-dev libncurses-dev zlib1g-dev \
-            rsync unzip gawk dos2unix bc \
-            libelf-dev pkg-config gcc-aarch64-linux-gnu clang lld llvm \
-            openjdk-17-jdk android-sdk-libsparse-utils
+            python3 python3-pip git curl \
+            rsync unzip zip bc bison flex \
+            libssl-dev libelf-dev libncurses-dev zlib1g-dev \
+            pkg-config openjdk-17-jdk
 
-      - name: "📥 Install Repo Tool"
+      - name: "Install Bazelisk (reads kernel_platform/.bazelversion)"
+        run: |
+          version=$(curl -fsSL https://api.github.com/repos/bazelbuild/bazelisk/releases/latest | grep -oP '"tag_name":\s*"v\K[^"]+')
+          curl -fsSL "https://github.com/bazelbuild/bazelisk/releases/download/v${version}/bazelisk-linux-amd64" -o bazelisk
+          chmod +x bazelisk
+          sudo mv bazelisk /usr/local/bin/bazel
+          bazel --version || true
+
+      - name: "Install Repo Tool"
         run: |
           curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
           chmod a+x ~/repo
           sudo mv ~/repo /usr/local/bin/repo
           repo --version
 
-      - name: "📥 Init & Sync Repos"
+      - name: "Init & Sync Official OnePlus Manifest"
         run: |
           set -euo pipefail
-          mkdir -p kernel_workspace
-          cd kernel_workspace
-
+          mkdir -p "$WORKSPACE"
+          cd "$WORKSPACE"
           repo init -u https://github.com/OnePlusOSS/kernel_manifest.git \
             -b oneplus/sm8750 \
             -m oneplus_pad_2_pro_b.xml \
@@ -71,247 +79,96 @@ jobs:
 
           repo sync -c -j"$(nproc --all)" --no-tags --no-clone-bundle --force-sync
 
-          echo "📂 workspace"
+          echo "workspace root:"
           ls -la
-          echo ""
-          echo "📂 kernel_platform"
+          echo "kernel_platform:"
           ls -la kernel_platform/
-          echo ""
-          echo "📂 common"
-          ls -la kernel_platform/common/ | head -20 || true
-          echo ""
-          echo "📂 msm-kernel"
-          ls -la kernel_platform/msm-kernel/ | head -20 || true
+          echo "oplus build scripts:"
+          ls -la kernel_platform/oplus/build/ | head
 
-      - name: "🔍 Check Build Inputs"
+      - name: "Apply optional custom config fragment"
         run: |
           set -euo pipefail
-          cd kernel_workspace/kernel_platform
-
-          test -d common || { echo "common directory missing"; exit 1; }
-          test -d msm-kernel || { echo "msm-kernel directory missing"; exit 1; }
-          test -f common/Makefile || { echo "common/Makefile missing"; exit 1; }
-          test -f msm-kernel/Makefile || { echo "msm-kernel/Makefile missing"; exit 1; }
-
-          echo "✅ common tree ready"
-          echo "✅ msm-kernel tree ready"
-
-      - name: "🔧 Setup ccache"
-        run: |
-          echo "CCACHE_DIR=$HOME/.ccache_pad2pro" >> "$GITHUB_ENV"
-          mkdir -p "$HOME/.ccache_pad2pro"
-          ccache -M "$CCACHE_MAXSIZE"
-          ccache -s
-
-      - name: "💾 Restore ccache"
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.CCACHE_DIR }}
-          key: ccache-pad2pro-${{ runner.os }}-${{ github.sha }}
-          restore-keys: |
-            ccache-pad2pro-${{ runner.os }}-
-
-      - name: "🔨 Build Kernel per BUILD_MODE"
-        run: |
-          set -euo pipefail
-          cd kernel_workspace/kernel_platform/common
-
-          CLANG_BIN=$(find ../prebuilts/clang -type f -name clang | head -n 1 || true)
-          if [ -n "$CLANG_BIN" ]; then
-            CLANG_DIR=$(dirname "$CLANG_BIN")
-            export PATH="$CLANG_DIR:$PATH"
-            echo "✅ 使用预编译 Clang: $CLANG_DIR"
-          else
-            echo "⚠️ 未找到预编译 Clang，使用系统 Clang"
+          if [ -n "$CUSTOM_CONFIG" ]; then
+            CONFIG_FILE="$ACK_DIR/msm-kernel/arch/arm64/configs/vendor/${TARGET}_${VARIANT}.config"
+            if [ -f "$CONFIG_FILE" ]; then
+              IFS=',' read -ra CFGS <<< "$CUSTOM_CONFIG"
+              for cfg in "${CFGS[@]}"; do
+                cfg="$(echo "$cfg" | tr -d '[:space:]')"
+                [ -z "$cfg" ] && continue
+                key="${cfg%%=*}"
+                grep -q "^${key}=" "$CONFIG_FILE" && sed -i "s|^${key}=.*|${cfg}|" "$CONFIG_FILE" \
+                  || echo "$cfg" >> "$CONFIG_FILE"
+                echo "applied: $cfg"
+              done
+            else
+              echo "custom config skipped: $CONFIG_FILE not found"
+            fi
           fi
 
-          export KBUILD_BUILD_USER="OnePlus"
-          export KBUILD_BUILD_HOST="GitHub-Actions"
-          export ARCH=arm64
-          export LLVM=1
-          export CC="ccache clang"
-          export LD=ld.lld
-          export HOSTCC=clang
-          export HOSTCXX=clang++
-          export CROSS_COMPILE="aarch64-linux-gnu-"
-          export KCFLAGS="${KCFLAGS:-} -Wno-error"
+      - name: "Build kernel via official Kleaf (build_with_bazel.py -t TARGET VARIANT)"
+        run: |
+          set -euo pipefail
+          cd "$ACK_DIR"
 
-          clang --version | head -1
-          ld.lld --version 2>/dev/null || true
-          aarch64-linux-gnu-gcc --version | head -1 || true
+          # JAVA_HOME: oplus scripts expect jdk21 at TOPDIR/prebuilts/jdk/jdk21, but the
+          # manifest only ships jdk11; bazel ships its own JDK so build does not depend on it.
+          export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+          export PATH="/usr/local/bin:$PATH"
 
-          build_one() {
-            local ODIR="$1"
-            local DEFCONFIG="$2"
-            local BAKE="$3"
-            local LOG="$4"
+          # official core build command (same as oplus_build_kernel.sh/prepare_vendor.sh invokes)
+          python3 build_with_bazel.py \
+            -t "$TARGET" "$VARIANT" \
+            --out_dir "$PWD/out/msm-kernel-${TARGET}-${VARIANT}" \
+            2>&1 | tee "$GITHUB_WORKSPACE/build-kernel-${TARGET}-${VARIANT}.log"
 
-            echo ""
-            echo "=== [$DEFCONFIG] O=$ODIR 开始构建 ==="
-            rm -rf "$ODIR"
-            make O="$ODIR" ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ \
-                 CROSS_COMPILE="$CROSS_COMPILE" "$DEFCONFIG"
+          echo
+          echo "=== dist output ==="
+          ls -la "$PWD/out/msm-kernel-${TARGET}-${VARIANT}/dist/" || true
 
-            if [ "$BAKE" = "1" ]; then
-              if [ -n "${CUSTOM_CONFIG// }" ]; then
-                echo "📋 应用自定义配置: $CUSTOM_CONFIG"
-                IFS=',' read -ra CFG_ITEMS <<< "$CUSTOM_CONFIG"
-                for item in "${CFG_ITEMS[@]}"; do
-                  item="${item//[$'\r\n']/}"
-                  item="${item#${item%%[![:space:]]*}}"
-                  item="${item%${item##*[![:space:]]}}"
-                  if [ -z "$item" ]; then
-                    continue
-                  fi
-                  if [[ "$item" =~ ^CONFIG_[A-Z0-9_]+=([ymn]|[0-9]+)$ ]]; then
-                    name="${item%%=*}"
-                    value="${item#*=}"
-                    echo "  -> $name=$value"
-                    ./scripts/config --file "$ODIR/.config" --set-val "$name" "$value"
-                  else
-                    echo "⚠️ 忽略非法配置项: $item"
-                  fi
-                done
-              fi
-              echo "🔧 将设备驱动内置进内核（CONFIG_*=m -> CONFIG_*=y）"
-              sed -i 's/^\(CONFIG_[A-Z0-9_]*\)=m$/\1=y/' "$ODIR/.config"
-            fi
-
-            make O="$ODIR" ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ \
-                 CROSS_COMPILE="$CROSS_COMPILE" olddefconfig
-
-            echo ""
-            echo "🔧 编译 Image ..."
-            make -j"$(nproc --all)" O="$ODIR" ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ \
-                 CROSS_COMPILE="$CROSS_COMPILE" Image 2>&1 | tee "$LOG"
-
-            if [ "$BAKE" = "0" ]; then
-              echo ""
-              echo "🔧 编译 GKI 附加镜像 (Image.gz / Image.lz4) ..."
-              make -j"$(nproc --all)" O="$ODIR" ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ \
-                   CROSS_COMPILE="$CROSS_COMPILE" Image.gz Image.lz4 2>&1 | tee -a "$LOG"
-            fi
-
-            echo "=== [$DEFCONFIG] 构建完成 ==="
-          }
-
-          case "$BUILD_MODE" in
-            gki)
-              build_one out_gki gki_defconfig 0 ../build-gki.log
-              ;;
-            both)
-              build_one out "$KERNEL_DEFCONFIG" 1 ../build-kernelonly.log
-              build_one out_gki gki_defconfig 0 ../build-gki.log
-              ;;
-            *)
-              echo "BUILD_MODE=$BUILD_MODE → 按 kernel-only 处理"
-              build_one out "$KERNEL_DEFCONFIG" 1 ../build-kernelonly.log
-              ;;
-          esac
-
-      - name: "📦 Collect Build Artifacts"
+      - name: "Collect dist artifacts"
         if: always()
         run: |
           set -euo pipefail
-          cd kernel_workspace/kernel_platform 2>/dev/null || { mkdir -p kernel_workspace/kernel_platform/Final-Image; exit 0; }
+          DIST="$ACK_DIR/out/msm-kernel-${TARGET}-${VARIANT}/dist"
+          DEST="$GITHUB_WORKSPACE/Final-Image"
+          mkdir -p "$DEST/modules" "$DEST/dtb"
 
-          collect_kernel() {
-            local SRC="$1"
-            local DEST="$2"
-            local LOG="$3"
+          if [ ! -d "$DIST" ]; then
+            echo "dist directory missing, nothing to collect"
+            exit 0
+          fi
 
-            if [ -f "$SRC/arch/arm64/boot/Image" ]; then
-              cp "$SRC/arch/arm64/boot/Image" "$DEST/Image"
+          for f in boot.img init_boot.img vendor_boot.img Image Image.gz Image.lz4 \
+                   vmlinux System.map .config; do
+            if [ -f "$DIST/$f" ]; then
+              cp "$DIST/$f" "$DEST/$(basename "$f")"
             fi
-            if [ -f "$SRC/arch/arm64/boot/Image.gz" ]; then
-              cp "$SRC/arch/arm64/boot/Image.gz" "$DEST/Image.gz"
-            fi
-            if [ -f "$SRC/arch/arm64/boot/Image.lz4" ]; then
-              cp "$SRC/arch/arm64/boot/Image.lz4" "$DEST/Image.lz4"
-            fi
-            if [ -f "$SRC/.config" ]; then
-              cp "$SRC/.config" "$DEST/kernel.config"
-            fi
-            if [ -f "$SRC/vmlinux" ]; then
-              cp "$SRC/vmlinux" "$DEST/vmlinux"
-            fi
-            if [ -s "$LOG" ]; then
-              cp "$LOG" "$DEST/build.log"
-            fi
-            find "$SRC" -name '*.ko' -type f -exec cp {} "$DEST/modules/" \; 2>/dev/null || true
+          done
 
-            if command -v mkbootimg >/dev/null && [ -f "$DEST/Image" ]; then
-              local DTB_FILE
-              DTB_FILE=$(find "$SRC" -name '*.dtb' -path '*boot/dts*' | head -n 1 || true)
-              if [ -n "$DTB_FILE" ]; then
-                mkbootimg --kernel "$DEST/Image" \
-                  --ramdisk /dev/null \
-                  --output "$DEST/boot.img" \
-                  --pagesize 4096 \
-                  --base 0x10000000 \
-                  --dtb "$DTB_FILE" \
-                  --header_version 4 \
-                  --os_version 16 \
-                  --os_patch_level 2026-08-09 \
-                  --cmdline 'console=ttyMSM0,115200n8 earlycon' || true
-              else
-                mkbootimg --kernel "$DEST/Image" \
-                  --ramdisk /dev/null \
-                  --output "$DEST/boot.img" \
-                  --pagesize 4096 \
-                  --base 0x10000000 \
-                  --header_version 4 \
-                  --os_version 16 \
-                  --os_patch_level 2026-08-09 \
-                  --cmdline 'console=ttyMSM0,115200n8 earlycon' || true
-              fi
-            elif [ -f "$DEST/Image" ]; then
-              cp "$DEST/Image" "$DEST/boot.img"
-              echo "mkbootimg unavailable; using raw Image as boot.img" > "$DEST/bootimg_status.txt"
-            fi
-          }
+          cp "$DIST"/*.dtb "$DEST/dtb/" 2>/dev/null || true
+          cp "$DIST"/*.dtbo "$DEST/dtb/" 2>/dev/null || true
+          cp "$DIST"/*.ko "$DEST/modules/" 2>/dev/null || true
+          cp "$DIST"/modules.load "$DEST/" 2>/dev/null || true
+          cp "$DIST"/vendor_dlkm.modules.load "$DEST/" 2>/dev/null || true
 
-          mkdir -p Final-Image/modules Final-Image/gki/modules
+          echo "Artifact layout:"
+          find "$DEST" -maxdepth 2 -type f | sort | sed 's#^# - #' || true
 
-          case "$BUILD_MODE" in
-            gki)
-              collect_kernel common/out_gki Final-Image/gki ../build-gki.log
-              # No kernel-only artifacts in this mode; root is empty by design
-              ;;
-            both)
-              collect_kernel common/out Final-Image ../build-kernelonly.log
-              collect_kernel common/out_gki Final-Image/gki ../build-gki.log
-              ;;
-            *)
-              collect_kernel common/out Final-Image ../build-kernelonly.log
-              ;;
-          esac
-
-          echo "📦 Artifact layout"
-          find Final-Image -maxdepth 2 -type f | sort | sed 's#^# - #' || true
-
-      - name: "📤 Upload Kernel Artifacts"
+      - name: "Upload Kernel Artifacts"
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kernel_pad2pro_repo_build
+          name: kernel_pad2pro_${{ inputs.TARGET }}_${{ inputs.VARIANT }}
           path: |
-            kernel_workspace/kernel_platform/Final-Image
+            Final-Image
           retention-days: 7
 
-      - name: "📝 Ensure Build Log Exists"
-        if: always()
-        run: |
-          mkdir -p kernel_workspace/kernel_platform
-          touch kernel_workspace/kernel_platform/build-kernelonly.log
-          touch kernel_workspace/kernel_platform/build-gki.log
-
-      - name: "📤 Upload Build Log"
+      - name: "Upload Build Log"
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build_log_pad2pro_repo_build
+          name: build_log_pad2pro_${{ inputs.TARGET }}_${{ inputs.VARIANT }}
           path: |
-            kernel_workspace/kernel_platform/build-kernelonly.log
-            kernel_workspace/kernel_platform/build-gki.log
+            build-kernel-${{ inputs.TARGET }}-${{ inputs.VARIANT }}.log
           retention-days: 3
