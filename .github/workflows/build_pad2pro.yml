@@ -1,0 +1,80 @@
+name: Build OnePlus Pad 2 Pro GKI Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      KERNEL_REPO:
+        description: 'Kernel Source URL'
+        required: true
+        default: 'https://github.com/OnePlusOSS/android_kernel_oneplus_sm8750'
+      KERNEL_BRANCH:
+        description: 'Kernel Branch'
+        required: true
+        default: 'oneplus/sm8750_b_16.0.0_pad_2_pro'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Maximize Build Space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 24576
+          swap-size-mb: 8192
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-bloat: 'true'
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev lib32z1-dev libelf-dev liblz4-tool libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc yasm zlib1g-dev python3 python-is-python3 python3-pip bazel
+
+      - name: Clone Kernel Source
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git clone --depth=1 ${{ github.event.inputs.KERNEL_REPO }} -b ${{ github.event.inputs.KERNEL_BRANCH }} kernel_source
+
+      - name: Build SM8750 GKI Kernel (Kleaf)
+        run: |
+          cd kernel_source
+          
+          # 检查并使用 Kleaf (Bazel) 编译系统
+          if [ -f "tools/bazel" ]; then
+            echo "Building using tools/bazel..."
+            # 常见 DIST 目标，可根据当前分支的 BUILD 文件调整
+            tools/bazel run //common:kernel_aarch64_dist -- --dist_dir=out/dist
+          elif [ -f "build/bazel.sh" ]; then
+            echo "Building using build/bazel.sh..."
+            bash build/bazel.sh
+          elif [ -f "build/build.sh" ]; then
+            echo "Building using build.sh..."
+            bash build/build.sh
+          else
+            echo "No standard build script found!"
+            exit 1
+          fi
+
+      - name: Collect Kernel Image and All Driver Modules (.ko)
+        run: |
+          cd kernel_source
+          mkdir -p final_output/modules
+          
+          # 1. 收集核心内核镜像和设备树
+          find . -name "Image" -o -name "Image.gz" -o -name "*.dtb" | while read file; do
+            cp "$file" final_output/
+          done
+          
+          # 2. 强制把编译生成的 Wi-Fi、蓝牙等所有 .ko 动态模块全部抓取出来
+          # 确保驱动模块不遗漏，避免开机无 Wi-Fi/蓝牙
+          find . -name "*.ko" -exec cp {} final_output/modules/ \;
+          
+          echo "Successfully collected Image and $(ls final_output/modules | wc -l) driver modules."
+
+      - name: Upload Kernel Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: OnePlus-Pad-2-Pro-Kernel-Outputs
+          path: kernel_source/final_output/
