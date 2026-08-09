@@ -207,6 +207,7 @@ jobs:
             ARCH=arm64 \
             CC="ccache clang" \
             LD=ld.lld \
+            HOSTLD=ld.lld \
             CROSS_COMPILE=${CROSS_COMPILE} \
             O=out \
             gki_defconfig all 2>&1 | tee ../build_common.log
