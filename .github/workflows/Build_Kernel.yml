@@ -28,7 +28,8 @@ jobs:
       CCACHE_MAXSIZE: 8G
       CUSTOM_CONFIG: ${{ github.event.inputs.CUSTOM_CONFIG }}
       BUILD_MODE: ${{ github.event.inputs.BUILD_MODE }}
-      KERNEL_DEFCONFIG: sun_le_defconfig
+      KERNEL_DEFCONFIG: generic_le_defconfig
+      KERNEL_VARIANT: perf
 
     steps:
       - name: "🚀 Maximize Build Space"
@@ -49,7 +50,7 @@ jobs:
             build-essential flex bison libssl-dev libncurses-dev zlib1g-dev \
             rsync unzip gawk dos2unix bc \
             libelf-dev pkg-config gcc-aarch64-linux-gnu clang lld llvm \
-            openjdk-17-jdk android-sdk-libsparse-utils
+            openjdk-17-jdk android-tools-fsutils
 
       - name: "📥 Install Repo Tool"
         run: |
@@ -164,8 +165,27 @@ jobs:
 
           echo ""
           echo "BUILD_MODE=${BUILD_MODE}"
-          echo "🔧 使用目标配置: $KERNEL_DEFCONFIG"
-          make O=out ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE="$CROSS_COMPILE" "$KERNEL_DEFCONFIG"
+          echo "KERNEL_VARIANT=${KERNEL_VARIANT}"
+          echo "🔧 使用基础配置: $KERNEL_DEFCONFIG"
+
+          # 使用官方 merge_config.sh 合并 defconfig 和 vendor 配置片段
+          # 这与 build.config.msm.sun.le 中的 apply_defconfig_fragment 逻辑一致
+          DEFCONFIG_FRAGMENTS="arch/arm64/configs/${KERNEL_DEFCONFIG} arch/arm64/configs/vendor/sun_le.config"
+
+          if [ "$KERNEL_VARIANT" = "debug" ]; then
+            if [ -f "arch/arm64/configs/vendor/sun_le_debug.config" ]; then
+              DEFCONFIG_FRAGMENTS="$DEFCONFIG_FRAGMENTS arch/arm64/configs/vendor/sun_le_debug.config"
+            fi
+          fi
+
+          echo "📋 合并配置片段: $DEFCONFIG_FRAGMENTS"
+          mkdir -p out
+          KCONFIG_CONFIG=out/.config ./scripts/kconfig/merge_config.sh -m -r -y $DEFCONFIG_FRAGMENTS
+          echo "✅ 配置合并完成，已生成 out/.config"
+
+          # 验证配置并填充默认值
+          echo "🔧 运行 olddefconfig 验证配置..."
+          yes '' | make O=out ARCH=arm64 LLVM=1 CC="ccache clang" LD=ld.lld HOSTCC=clang HOSTCXX=clang++ CROSS_COMPILE="$CROSS_COMPILE" olddefconfig
 
           if [ -n "${CUSTOM_CONFIG// }" ]; then
             echo "📋 应用自定义配置: $CUSTOM_CONFIG"
