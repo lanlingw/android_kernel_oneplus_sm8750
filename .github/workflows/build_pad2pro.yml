@@ -148,6 +148,9 @@ jobs:
           # 正确做法: 用 defconfig_fragments 机制 (增量配置, 不经过 savedefconfig 检查)
           #          参考 BUILD.bazel 里 kernel_aarch64_autofdo 的用法
 
+          # 注意: PID_NS 曾被怀疑导致启动失败, 但实际是 init_boot.img 缺失所致
+          #       (init_boot.img 在 GKI common dist 目录, 不在 msm-kernel dist, 之前漏收集)
+          #       既然用户确认之前 PID_NS 能启动, 这里全部加回
           CUSTOM_CONFIGS=(
             "CONFIG_SYSVIPC=y"
             "CONFIG_POSIX_MQUEUE=y"
@@ -238,16 +241,43 @@ jobs:
             exit 0
           fi
 
+          # GKI common 的 dist 目录 (perf 变体下 boot.img/init_boot.img 来自 //common:kernel_aarch64)
+          # 日志显示 init_boot.img 实际生成在 out/android15-6.6/dist/ (GKI common dist)
+          # 而不是 msm-kernel-sun-perf/dist/, 需要额外从这里收集
+          GKI_COMMON_DIST="kernel_platform/common/out/android15-6.6/dist"
+          # 备选路径 (不同 bazel 版本可能放在不同位置)
+          GKI_COMMON_DIST_ALT="kernel_platform/out/android15-6.6/dist"
+
+          echo "📦 Dist dirs:"
+          echo "  msm-kernel: $DIST_DIR"
+          echo "  gki-common: $GKI_COMMON_DIST (or $GKI_COMMON_DIST_ALT)"
+          ls -la "$DIST_DIR" 2>/dev/null | head -20 || true
+          echo "  ---"
+          ls -la "$GKI_COMMON_DIST" 2>/dev/null | head -20 || true
+          echo "  ---"
+          ls -la "$GKI_COMMON_DIST_ALT" 2>/dev/null | head -20 || true
+
           mkdir -p Final-Image/modules
-          # boot.img / init_boot.img: perf 变体来自 GKI common 内核, consolidate 变体本 target 自建
+          # boot.img: perf 变体来自 GKI common, consolidate 变体本 target 自建
           cp -v "$DIST_DIR"/boot.img         Final-Image/ 2>/dev/null || true
-          cp -v "$DIST_DIR"/init_boot.img    Final-Image/ 2>/dev/null || true
+          # init_boot.img: perf 变体下来自 GKI common dist 目录 (不在 msm-kernel dist 里)
+          if [ -f "$GKI_COMMON_DIST"/init_boot.img ]; then
+            cp -v "$GKI_COMMON_DIST"/init_boot.img Final-Image/
+          elif [ -f "$GKI_COMMON_DIST_ALT"/init_boot.img ]; then
+            cp -v "$GKI_COMMON_DIST_ALT"/init_boot.img Final-Image/
+          elif [ -f "$DIST_DIR"/init_boot.img ]; then
+            cp -v "$DIST_DIR"/init_boot.img Final-Image/
+          else
+            echo "⚠️ init_boot.img not found in any dist dir!"
+            find kernel_platform -name "init_boot.img" -type f 2>/dev/null | head -5
+          fi
           # dtbo.img / vendor_boot.img: sun 平台有 dtbo_list, 两个都会生成
           cp -v "$DIST_DIR"/dtbo.img         Final-Image/ 2>/dev/null || true
           cp -v "$DIST_DIR"/vendor_boot.img  Final-Image/ 2>/dev/null || true
           # vendor_dlkm.img: build_vendor_dlkm 默认 True
           cp -v "$DIST_DIR"/vendor_dlkm.img  Final-Image/ 2>/dev/null || true
-          # 注: system_dlkm.img 不会生成 (bazel build_system_dlkm 默认 False)
+          # 注: system_dlkm.img 不会单独生成 (bazel build_system_dlkm 默认 False)
+          #     super.img 也不收集 (会覆盖整个 super 分区, 风险大, 标准 GKI 刷机不需要)
 
           cp -v "$DIST_DIR"/Image            Final-Image/ 2>/dev/null || true
           cp -v "$DIST_DIR"/Image.gz         Final-Image/ 2>/dev/null || true
