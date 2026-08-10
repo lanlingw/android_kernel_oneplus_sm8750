@@ -146,6 +146,31 @@ jobs:
           echo "🔧 After patch:"
           grep -n "boot_image_outs" "$MSM_KERNEL_LA" | head -5
 
+          # 创建 build_with_bazel.py 在 __init__ 里会创建的符号链接
+          # (setup_extensions 方法, build_with_bazel.py:106-127)
+          # 直接调用 tools/bazel 时缺少这一步, 会导致:
+          #   ERROR: cannot load '//build:msm_kernel_extensions.bzl': no such file
+          echo ""
+          echo "🔗 Creating extension symlinks (mimic build_with_bazel.py setup_extensions)..."
+          cd kernel_platform
+          mkdir -p build
+          # build/msm_kernel_extensions.bzl → ../msm-kernel/msm_kernel_extensions.bzl
+          if [ ! -e build/msm_kernel_extensions.bzl ]; then
+            ln -sf ../msm-kernel/msm_kernel_extensions.bzl build/msm_kernel_extensions.bzl
+            echo "  + build/msm_kernel_extensions.bzl -> ../msm-kernel/msm_kernel_extensions.bzl"
+          else
+            echo "  = build/msm_kernel_extensions.bzl already exists"
+          fi
+          # build/abl_extensions.bzl → ../bootable/bootloader/edk2/abl_extensions.bzl
+          # 注: manifest 不包含 edk2 仓库, 这个符号链接会是 dead link, 但 skip_abl=true 时不影响
+          if [ ! -e build/abl_extensions.bzl ]; then
+            ln -sf ../bootable/bootloader/edk2/abl_extensions.bzl build/abl_extensions.bzl
+            echo "  + build/abl_extensions.bzl -> ../bootable/bootloader/edk2/abl_extensions.bzl (may be dead link)"
+          else
+            echo "  = build/abl_extensions.bzl already exists"
+          fi
+          ls -la build/*.bzl
+
       - name: "🔍 Bazel cquery: Verify init_boot.img in output list"
         run: |
           set -uo pipefail
