@@ -211,6 +211,118 @@ jobs:
           echo "🔧 Verify: grep defconfig_fragments in BUILD.bazel"
           grep -n "defconfig_fragments" "$BUILD_FILE" | head -10
 
+          # 3. patch msm_kernel_la.bzl: 让有 dtb_list 的平台也 dist init_boot.img
+          # 根因: msm_kernel_la.bzl 第 506 行
+          #   boot_image_outs = None if dtb_list else ["boot.img", "init_boot.img"]
+          # sun 平台有 dtb_list, 所以 boot_image_outs = None
+          # init_boot.img 在 boot_images action 里生成了 (日志可证), 但不是 declared output,
+          # 所以不会被 sun_perf_dist dist 到最终目录
+          # 修复: 有 dtb_list 时也把 init_boot.img 加到 boot_image_outs
+          MSM_KERNEL_LA="kernel_platform/msm-kernel/msm_kernel_la.bzl"
+          if [ ! -f "$MSM_KERNEL_LA" ]; then
+            echo "❌ $MSM_KERNEL_LA not found"
+            exit 1
+          fi
+
+          python3 - << 'PYEOF'
+          import re
+          bzl_file = "kernel_platform/msm-kernel/msm_kernel_la.bzl"
+          with open(bzl_file, "r") as f:
+              content = f.read()
+
+          old = 'boot_image_outs = None if dtb_list else ["boot.img", "init_boot.img"],'
+          new = 'boot_image_outs = ["init_boot.img"] if dtb_list else ["boot.img", "init_boot.img"],'
+          if old in content:
+              content = content.replace(old, new)
+              with open(bzl_file, "w") as f:
+                  f.write(content)
+              print(f"✓ Patched boot_image_outs in {bzl_file}")
+          elif new in content:
+              print(f"✓ boot_image_outs already patched, skip")
+          else:
+              print(f"⚠️ Could not find boot_image_outs line to patch!")
+              exit(1)
+          PYEOF
+
+          echo ""
+          echo "🔧 Verify: grep boot_image_outs in msm_kernel_la.bzl"
+          grep -n "boot_image_outs" "$MSM_KERNEL_LA" | head -10
+
+          # 4. 创建 build_with_bazel.py 在 __init__ 里会创建的符号链接
+          # (setup_extensions 方法, build_with_bazel.py:106-127)
+          # 虽然下面 oplus_build_kernel.sh -> build_with_bazel.py 会自动创建,
+          # 但提前创建可以避免某些竞态条件下首次加载失败的问题
+          echo ""
+          echo "🔗 Creating extension symlinks (mimic build_with_bazel.py setup_extensions)..."
+          cd kernel_platform
+          mkdir -p build
+          # build/msm_kernel_extensions.bzl → ../msm-kernel/msm_kernel_extensions.bzl
+          if [ ! -e build/msm_kernel_extensions.bzl ]; then
+            ln -sf ../msm-kernel/msm_kernel_extensions.bzl build/msm_kernel_extensions.bzl
+            echo "  + build/msm_kernel_extensions.bzl -> ../msm-kernel/msm_kernel_extensions.bzl"
+          else
+            echo "  = build/msm_kernel_extensions.bzl already exists"
+          fi
+          # build/abl_extensions.bzl → ../bootable/bootloader/edk2/abl_extensions.bzl
+          # 注: manifest 不包含 edk2 仓库, 这个符号链接会是 dead link, 但 skip_abl=true 时不影响
+          if [ ! -e build/abl_extensions.bzl ]; then
+            ln -sf ../bootable/bootloader/edk2/abl_extensions.bzl build/abl_extensions.bzl
+            echo "  + build/abl_extensions.bzl -> ../bootable/bootloader/edk2/abl_extensions.bzl (may be dead link)"
+          else
+            echo "  = build/abl_extensions.bzl already exists"
+          fi
+          ls -la build/*.bzl
+
+      - name: "🔍 Bazel cquery: Verify init_boot.img in output list"
+        run: |
+          set -uo pipefail
+          cd kernel_workspace/kernel_platform
+
+          echo "🔍 Querying //msm-kernel:${KERNEL_PLATFORM}_${KERNEL_VARIANT}_images output files..."
+          echo "(This only analyzes the build graph, does NOT compile. Takes ~1-2 minutes)"
+          echo ""
+
+          # 注意: 不用 set -e, 让 cquery 失败后能继续到下面的 if 判断给出清晰错误信息
+          # pipefail + || true 兜底, 保证管道退出码不触发退出
+          tools/bazel cquery \
+            --//msm-kernel:skip_abl=true \
+            --//msm-kernel:skip_abi=true \
+            --ignore_missing_projects \
+            --incompatible_sandbox_hermetic_tmp=false \
+            "//msm-kernel:${KERNEL_PLATFORM}_${KERNEL_VARIANT}_images" \
+            --output=files > cquery_output.txt 2>&1 || true
+
+          echo "=============================="
+          echo "🔍 cquery output (first 50 lines):"
+          echo "=============================="
+          head -50 cquery_output.txt
+          echo ""
+          echo "=============================="
+          echo "🔍 Checking init_boot.img in output list:"
+          echo "=============================="
+
+          if grep -q "init_boot.img" cquery_output.txt; then
+            echo "✅ init_boot.img IS in the output list (patch生效!)"
+            grep "init_boot" cquery_output.txt
+          else
+            echo "❌ init_boot.img NOT in output list (patch失败或语义理解错误)"
+            echo ""
+            echo "Full cquery output:"
+            cat cquery_output.txt
+            # 不 exit 1, 让后面的构建步骤继续运行, 看实际构建能否生成 init_boot.img
+            echo ""
+            echo "⚠️ Continuing anyway - actual build may still generate init_boot.img"
+          fi
+
+      - name: "📤 Upload cquery Output"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cquery_output
+          path: kernel_workspace/kernel_platform/cquery_output.txt
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: "🔨 Build Kernel via Official Script"
         run: |
           set -euo pipefail
@@ -241,36 +353,19 @@ jobs:
             exit 0
           fi
 
-          # GKI common 的 dist 目录 (perf 变体下 boot.img/init_boot.img 来自 //common:kernel_aarch64)
-          # 日志显示 init_boot.img 实际生成在 out/android15-6.6/dist/ (GKI common dist)
-          # 而不是 msm-kernel-sun-perf/dist/, 需要额外从这里收集
-          GKI_COMMON_DIST="kernel_platform/common/out/android15-6.6/dist"
-          # 备选路径 (不同 bazel 版本可能放在不同位置)
-          GKI_COMMON_DIST_ALT="kernel_platform/out/android15-6.6/dist"
-
-          echo "📦 Dist dirs:"
-          echo "  msm-kernel: $DIST_DIR"
-          echo "  gki-common: $GKI_COMMON_DIST (or $GKI_COMMON_DIST_ALT)"
-          ls -la "$DIST_DIR" 2>/dev/null | head -20 || true
-          echo "  ---"
-          ls -la "$GKI_COMMON_DIST" 2>/dev/null | head -20 || true
-          echo "  ---"
-          ls -la "$GKI_COMMON_DIST_ALT" 2>/dev/null | head -20 || true
+          echo "📦 Dist dir: $DIST_DIR"
+          ls -la "$DIST_DIR" 2>/dev/null | head -30 || true
 
           mkdir -p Final-Image/modules
-          # boot.img: perf 变体来自 GKI common, consolidate 变体本 target 自建
+          # boot.img: perf 变体来自 GKI common (avb_sign_boot_image 处理后 dist)
           cp -v "$DIST_DIR"/boot.img         Final-Image/ 2>/dev/null || true
-          # init_boot.img: perf 变体下来自 GKI common dist 目录 (不在 msm-kernel dist 里)
-          if [ -f "$GKI_COMMON_DIST"/init_boot.img ]; then
-            cp -v "$GKI_COMMON_DIST"/init_boot.img Final-Image/
-          elif [ -f "$GKI_COMMON_DIST_ALT"/init_boot.img ]; then
-            cp -v "$GKI_COMMON_DIST_ALT"/init_boot.img Final-Image/
-          elif [ -f "$DIST_DIR"/init_boot.img ]; then
-            cp -v "$DIST_DIR"/init_boot.img Final-Image/
-          else
-            echo "⚠️ init_boot.img not found in any dist dir!"
+          # init_boot.img: 上面 patch 了 msm_kernel_la.bzl 的 boot_image_outs,
+          # 让有 dtb_list 的平台也声明 init_boot.img 为 output, 这样 sun_perf_dist 会 dist 它
+          cp -v "$DIST_DIR"/init_boot.img    Final-Image/ 2>/dev/null || {
+            echo "⚠️ init_boot.img not found in $DIST_DIR!"
+            echo "  Searching workspace for init_boot.img..."
             find kernel_platform -name "init_boot.img" -type f 2>/dev/null | head -5
-          fi
+          }
           # dtbo.img / vendor_boot.img: sun 平台有 dtbo_list, 两个都会生成
           cp -v "$DIST_DIR"/dtbo.img         Final-Image/ 2>/dev/null || true
           cp -v "$DIST_DIR"/vendor_boot.img  Final-Image/ 2>/dev/null || true
