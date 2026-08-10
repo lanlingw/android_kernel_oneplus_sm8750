@@ -1,0 +1,284 @@
+name: Build OnePlus Pad 2 Pro init_boot.img (standalone)
+
+# 单独生成 init_boot.img, 用于验证 boot_image_outs patch 是否生效
+# 跟完整工作流 (build_pad2pro_bootimg.yml) 的区别:
+#   1. 只构建 perf 变体 (不构建 16k, 省约 30 分钟)
+#   2. 直接 bazel build //msm-kernel:sun_perf_images (不跑 dist, 不跑 oplus_build_kernel.sh)
+#   3. 不应用 custom kernel config (只验证 init_boot.img 生成)
+#   4. 构建前用 bazel cquery 快速验证 init_boot.img 在输出列表里
+#   5. 只上传 init_boot.img + 构建日志
+#
+# 注意: init_boot.img 依赖整个 GKI 内核构建 (内核 Image + vendor 模块安装),
+#       无法真正"快速"生成, 仍需约 1.5-2 小时
+
+on:
+  workflow_dispatch:
+    inputs:
+      MANIFEST_BRANCH:
+        description: 'kernel_manifest 仓库分支'
+        required: true
+        default: 'oneplus/sm8750'
+      MANIFEST_FILE:
+        description: 'manifest 文件名'
+        required: true
+        default: 'oneplus_pad_2_pro_b.xml'
+      KERNEL_PLATFORM:
+        description: '平台代号 (SM8750 = sun)'
+        required: true
+        default: 'sun'
+      KERNEL_VARIANT:
+        description: '构建变体'
+        required: true
+        type: choice
+        default: 'perf'
+        options:
+          - 'perf'
+          - 'consolidate'
+
+jobs:
+  build:
+    name: Build init_boot.img only
+    runs-on: ubuntu-22.04
+    timeout-minutes: 600
+
+    env:
+      MANIFEST_BRANCH: ${{ github.event.inputs.MANIFEST_BRANCH }}
+      MANIFEST_FILE: ${{ github.event.inputs.MANIFEST_FILE }}
+      KERNEL_PLATFORM: ${{ github.event.inputs.KERNEL_PLATFORM }}
+      KERNEL_VARIANT: ${{ github.event.inputs.KERNEL_VARIANT }}
+
+    steps:
+      - name: "🚀 Maximize Build Space"
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 28672
+          temp-reserve-mb: 8192
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - name: "📦 Install Build Dependencies"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            python3 python-is-python3 git curl wget ccache \
+            build-essential flex bison libssl-dev libncurses-dev zlib1g-dev \
+            rsync unzip gawk dos2unix bc \
+            libelf-dev pkg-config gcc-aarch64-linux-gnu clang lld llvm \
+            openjdk-17-jdk android-sdk-libsparse-utils \
+            lib32ncurses5-dev lib32z1-dev libxml2-utils lzop pngcrush \
+            schedtool squashfs-tools xsltproc yasm cpio
+
+      - name: "📥 Install Repo Tool"
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
+          chmod a+x ~/repo
+          sudo mv ~/repo /usr/local/bin/repo
+          repo --version
+
+      - name: "📥 Init & Sync Manifest"
+        run: |
+          set -euo pipefail
+          mkdir -p kernel_workspace
+          cd kernel_workspace
+          repo init -u https://github.com/OnePlusOSS/kernel_manifest.git \
+            -b "${MANIFEST_BRANCH}" \
+            -m "${MANIFEST_FILE}" \
+            --depth=1
+          repo sync -c -j"$(nproc --all)" --no-tags --no-clone-bundle --force-sync
+          echo "📂 workspace root"
+          ls -la
+          echo "📂 kernel_platform"
+          ls -la kernel_platform/ | head -30
+
+      - name: "🔍 Verify Build Inputs"
+        run: |
+          set -euo pipefail
+          cd kernel_workspace
+          test -f kernel_platform/oplus/build/oplus_build_kernel.sh || { echo "oplus_build_kernel.sh missing"; exit 1; }
+          test -f kernel_platform/build_with_bazel.py || { echo "build_with_bazel.py missing"; exit 1; }
+          test -x kernel_platform/tools/bazel || { echo "tools/bazel missing"; exit 1; }
+          test -f kernel_platform/msm-kernel/msm_kernel_la.bzl || { echo "msm_kernel_la.bzl missing"; exit 1; }
+          echo "✅ All build inputs ready"
+
+      - name: "⚙️ Patch boot_image_outs (declare init_boot.img as output)"
+        run: |
+          set -euo pipefail
+          cd kernel_workspace
+
+          # 根因: msm_kernel_la.bzl 里
+          #   boot_image_outs = None if dtb_list else ["boot.img", "init_boot.img"]
+          # sun 平台有 dtb_list, 所以 boot_image_outs = None
+          # init_boot.img 在 boot_images action 里生成了, 但不是 declared output, 不会被 dist
+          # 修复: 有 dtb_list 时也声明 init_boot.img
+          MSM_KERNEL_LA="kernel_platform/msm-kernel/msm_kernel_la.bzl"
+          if [ ! -f "$MSM_KERNEL_LA" ]; then
+            echo "❌ $MSM_KERNEL_LA not found"
+            exit 1
+          fi
+
+          echo "🔧 Before patch:"
+          grep -n "boot_image_outs" "$MSM_KERNEL_LA" | head -5
+
+          python3 - << 'PYEOF'
+          bzl_file = "kernel_platform/msm-kernel/msm_kernel_la.bzl"
+          with open(bzl_file, "r") as f:
+              content = f.read()
+
+          old = 'boot_image_outs = None if dtb_list else ["boot.img", "init_boot.img"],'
+          new = 'boot_image_outs = ["init_boot.img"] if dtb_list else ["boot.img", "init_boot.img"],'
+          if old in content:
+              content = content.replace(old, new)
+              with open(bzl_file, "w") as f:
+                  f.write(content)
+              print(f"✓ Patched boot_image_outs")
+          elif new in content:
+              print(f"✓ boot_image_outs already patched")
+          else:
+              print(f"⚠️ Could not find boot_image_outs line!")
+              exit(1)
+          PYEOF
+
+          echo ""
+          echo "🔧 After patch:"
+          grep -n "boot_image_outs" "$MSM_KERNEL_LA" | head -5
+
+      - name: "🔍 Bazel cquery: Verify init_boot.img in output list"
+        run: |
+          set -uo pipefail
+          cd kernel_workspace/kernel_platform
+
+          echo "🔍 Querying //msm-kernel:${KERNEL_PLATFORM}_${KERNEL_VARIANT}_images output files..."
+          echo "(This only analyzes the build graph, does NOT compile. Takes ~1-2 minutes)"
+          echo ""
+
+          # 注意: 不用 set -e, 让 cquery 失败后能继续到下面的 if 判断给出清晰错误信息
+          # pipefail + || true 兜底, 保证管道退出码不触发退出
+          tools/bazel cquery \
+            --//msm-kernel:skip_abl=true \
+            --//msm-kernel:skip_abi=true \
+            --ignore_missing_projects \
+            --incompatible_sandbox_hermetic_tmp=false \
+            "//msm-kernel:${KERNEL_PLATFORM}_${KERNEL_VARIANT}_images" \
+            --output=files > cquery_output.txt 2>&1 || true
+
+          echo "=============================="
+          echo "🔍 cquery output (first 50 lines):"
+          echo "=============================="
+          head -50 cquery_output.txt
+          echo ""
+          echo "=============================="
+          echo "🔍 Checking init_boot.img in output list:"
+          echo "=============================="
+
+          if grep -q "init_boot.img" cquery_output.txt; then
+            echo "✅ init_boot.img IS in the output list (patch生效!)"
+            grep "init_boot" cquery_output.txt
+          else
+            echo "❌ init_boot.img NOT in output list (patch失败或语义理解错误)"
+            echo ""
+            echo "Full cquery output:"
+            cat cquery_output.txt
+            exit 1
+          fi
+
+      - name: "🔨 Bazel Build (perf only, no 16k, no dist)"
+        run: |
+          set -uo pipefail
+          cd kernel_workspace/kernel_platform
+
+          # 直接 bazel build (不通过 oplus_build_kernel.sh, 避免构建 16k 变体和跑 dist)
+          # 参数来自 build_full.log 第 22484 行 (oplus_build_kernel.sh 用的参数)
+          echo "🔨 Building //msm-kernel:${KERNEL_PLATFORM}_${KERNEL_VARIANT}_images ..."
+          echo "(This compiles the full GKI kernel + vendor modules, takes ~1.5-2 hours)"
+          echo ""
+
+          # 不用 set -e, 让 bazel 失败后用显式 if 判断退出
+          # 这样 if: always() 的后续步骤 (Find & Upload) 仍会执行
+          tools/bazel build \
+            --//msm-kernel:skip_abl=true \
+            --//msm-kernel:skip_abi=true \
+            --config=stamp \
+            --user_kmi_symbol_lists=//msm-kernel:android/abi_gki_aarch64_qcom \
+            --ignore_missing_projects \
+            --incompatible_sandbox_hermetic_tmp=false \
+            --nozstd_dwarf_compression \
+            "//msm-kernel:${KERNEL_PLATFORM}_${KERNEL_VARIANT}_images" 2>&1 | tee ../build_init_boot.log
+          BUILD_EXIT=${PIPESTATUS[0]}
+
+          echo ""
+          if [ "$BUILD_EXIT" -eq 0 ]; then
+            echo "✅ Build completed successfully"
+          else
+            echo "❌ Build failed with exit code $BUILD_EXIT"
+            echo "Continuing to collect any partial outputs and upload logs..."
+            # 不 exit, 让后续 if: always() 步骤收集日志和部分产物
+          fi
+
+      - name: "📦 Find & Collect init_boot.img"
+        if: always()
+        run: |
+          set -euo pipefail
+          cd kernel_workspace/kernel_platform
+
+          echo "🔍 Searching for init_boot.img in bazel-bin ..."
+          FOUND_INIT_BOOT=$(find bazel-bin -name "init_boot.img" -type f 2>/dev/null | head -5)
+
+          mkdir -p ../Final-Image
+
+          if [ -n "$FOUND_INIT_BOOT" ]; then
+            echo "✅ Found init_boot.img:"
+            echo "$FOUND_INIT_BOOT"
+            # 取第一个找到的
+            INIT_BOOT_PATH=$(echo "$FOUND_INIT_BOOT" | head -1)
+            cp -v "$INIT_BOOT_PATH" ../Final-Image/
+            echo ""
+            echo "📦 init_boot.img info:"
+            ls -la ../Final-Image/init_boot.img
+            file ../Final-Image/init_boot.img
+          else
+            echo "❌ init_boot.img NOT found in bazel-bin"
+            echo ""
+            echo "🔍 Searching entire workspace ..."
+            find . -name "init_boot.img" -type f 2>/dev/null | head -10
+            echo ""
+            echo "🔍 Listing bazel-bin/msm-kernel/ contents:"
+            ls -la bazel-bin/msm-kernel/ 2>/dev/null | head -20 || true
+            exit 1
+          fi
+
+          # 也收集 boot.img (如果存在) 作为参考
+          FOUND_BOOT=$(find bazel-bin -name "boot.img" -not -name "vendor_boot.img" -not -name "init_boot.img" -type f 2>/dev/null | head -1)
+          if [ -n "$FOUND_BOOT" ]; then
+            cp -v "$FOUND_BOOT" ../Final-Image/
+          fi
+
+      - name: "📤 Upload init_boot.img"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: init_boot_img_${{ env.KERNEL_PLATFORM }}_${{ env.KERNEL_VARIANT }}
+          path: kernel_workspace/Final-Image/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: "📤 Upload Build Log"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build_init_boot_log
+          path: kernel_workspace/build_init_boot.log
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: "📤 Upload cquery Output"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cquery_output
+          path: kernel_workspace/kernel_platform/cquery_output.txt
+          if-no-files-found: warn
+          retention-days: 30
