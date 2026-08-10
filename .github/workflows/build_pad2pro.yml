@@ -136,8 +136,12 @@ jobs:
           set -euo pipefail
           cd kernel_workspace
 
-          # 自定义内核配置项 (追加到 vendor/sun_perf.config, 会被 gki_defconfig 合并进最终 .config)
-          # 这些是 POSIX IPC / Namespace 相关, 默认 GKI 可能未全开
+          # perf 变体下 boot.img 内核本体来自 //common:kernel_aarch64, 用 gki_defconfig
+          # 必须改 GKI common 的 gki_defconfig, 改 msm-kernel/sun_perf.config 只影响 vendor_dlkm
+          #
+          # 实测 gki_defconfig 里:
+          #   # CONFIG_PID_NS is not set   <- 明确禁用
+          #   CONFIG_SYSVIPC / POSIX_MQUEUE / IPC_NS <- 未出现 (需显式开启)
           CUSTOM_CONFIGS=(
             "CONFIG_SYSVIPC=y"
             "CONFIG_POSIX_MQUEUE=y"
@@ -145,23 +149,21 @@ jobs:
             "CONFIG_PID_NS=y"
           )
 
-          # sun perf 变体用的 vendor config 文件
-          CONFIG_FILE="kernel_platform/msm-kernel/arch/arm64/configs/vendor/sun_perf.config"
+          # GKI 通用内核 defconfig (kernel_aarch64 target 用此文件)
+          CONFIG_FILE="kernel_platform/common/arch/arm64/configs/gki_defconfig"
           if [ ! -f "$CONFIG_FILE" ]; then
             echo "❌ $CONFIG_FILE not found"
-            echo "listing vendor config dir:"
-            ls kernel_platform/msm-kernel/arch/arm64/configs/vendor/ 2>/dev/null || true
+            echo "listing common arch/arm64/configs dir:"
+            ls kernel_platform/common/arch/arm64/configs/ 2>/dev/null || true
             exit 1
           fi
 
-          echo "🔧 Before patch, tail of $CONFIG_FILE:"
-          tail -5 "$CONFIG_FILE"
+          echo "🔧 Before patch, grep target configs in $CONFIG_FILE:"
+          grep -E "CONFIG_(SYSVIPC|POSIX_MQUEUE|IPC_NS|PID_NS)" "$CONFIG_FILE" || echo "  (none found)"
 
-          echo "" >> "$CONFIG_FILE"
-          echo "# === Custom configs from CI ($(date -u +%Y-%m-%dT%H:%M:%SZ)) ===" >> "$CONFIG_FILE"
           for config in "${CUSTOM_CONFIGS[@]}"; do
             KEY="${config%%=*}"
-            # 移除已存在的同 key 行 (无论 =y/=n/=m/# CONFIG is not set)
+            # 移除已存在的同 key 行 (支持 =y/=n/=m/# CONFIG is not set 四种形式)
             sed -i "/^${KEY}[= ]/d; /^# ${KEY} is not set/d" "$CONFIG_FILE"
             # 追加新配置
             echo "$config" >> "$CONFIG_FILE"
@@ -169,8 +171,21 @@ jobs:
           done
 
           echo ""
-          echo "🔧 After patch, tail of $CONFIG_FILE:"
-          tail -10 "$CONFIG_FILE"
+          echo "🔧 After patch, grep target configs:"
+          grep -E "CONFIG_(SYSVIPC|POSIX_MQUEUE|IPC_NS|PID_NS)" "$CONFIG_FILE"
+
+          # 同时 patch consolidate.fragment (如果将来切 consolidate 变体也能生效)
+          CONSOLIDATE_FRAGMENT="kernel_platform/common/arch/arm64/configs/consolidate.fragment"
+          if [ -f "$CONSOLIDATE_FRAGMENT" ]; then
+            echo ""
+            echo "🔧 Also patching $CONSOLIDATE_FRAGMENT (for consolidate variant)"
+            for config in "${CUSTOM_CONFIGS[@]}"; do
+              KEY="${config%%=*}"
+              sed -i "/^${KEY}[= ]/d; /^# ${KEY} is not set/d" "$CONSOLIDATE_FRAGMENT"
+              echo "$config" >> "$CONSOLIDATE_FRAGMENT"
+              echo "  + $config (consolidate)"
+            done
+          fi
 
       - name: "🔨 Build Kernel via Official Script"
         run: |
