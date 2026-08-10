@@ -137,11 +137,17 @@ jobs:
           cd kernel_workspace
 
           # perf 变体下 boot.img 内核本体来自 //common:kernel_aarch64, 用 gki_defconfig
-          # 必须改 GKI common 的 gki_defconfig, 改 msm-kernel/sun_perf.config 只影响 vendor_dlkm
+          # 必须改 GKI common 的配置, 改 msm-kernel/sun_perf.config 只影响 vendor_dlkm
           #
           # 实测 gki_defconfig 里:
           #   # CONFIG_PID_NS is not set   <- 明确禁用
           #   CONFIG_SYSVIPC / POSIX_MQUEUE / IPC_NS <- 未出现 (需显式开启)
+          #
+          # 注意: 不能直接改 gki_defconfig, Kleaf 会跑 savedefconfig 一致性检查,
+          #       配置项位置不对会报 "savedefconfig does not match" 错误.
+          # 正确做法: 用 defconfig_fragments 机制 (增量配置, 不经过 savedefconfig 检查)
+          #          参考 BUILD.bazel 里 kernel_aarch64_autofdo 的用法
+
           CUSTOM_CONFIGS=(
             "CONFIG_SYSVIPC=y"
             "CONFIG_POSIX_MQUEUE=y"
@@ -149,43 +155,58 @@ jobs:
             "CONFIG_PID_NS=y"
           )
 
-          # GKI 通用内核 defconfig (kernel_aarch64 target 用此文件)
-          CONFIG_FILE="kernel_platform/common/arch/arm64/configs/gki_defconfig"
-          if [ ! -f "$CONFIG_FILE" ]; then
-            echo "❌ $CONFIG_FILE not found"
-            echo "listing common arch/arm64/configs dir:"
-            ls kernel_platform/common/arch/arm64/configs/ 2>/dev/null || true
+          # 1. 创建 fragment 文件
+          FRAGMENT_FILE="kernel_platform/common/arch/arm64/configs/custom_gki.fragment"
+          cat > "$FRAGMENT_FILE" << 'EOF'
+          # === Custom configs from CI ===
+          EOF
+          for config in "${CUSTOM_CONFIGS[@]}"; do
+            echo "$config" >> "$FRAGMENT_FILE"
+            echo "  + $config"
+          done
+          echo "✅ Created fragment: $FRAGMENT_FILE"
+          cat "$FRAGMENT_FILE"
+
+          # 2. patch BUILD.bazel, 给 kernel_aarch64 和 kernel_aarch64_16k 加上 defconfig_fragments
+          BUILD_FILE="kernel_platform/common/BUILD.bazel"
+          if [ ! -f "$BUILD_FILE" ]; then
+            echo "❌ $BUILD_FILE not found"
             exit 1
           fi
 
-          echo "🔧 Before patch, grep target configs in $CONFIG_FILE:"
-          grep -E "CONFIG_(SYSVIPC|POSIX_MQUEUE|IPC_NS|PID_NS)" "$CONFIG_FILE" || echo "  (none found)"
+          python3 - << 'PYEOF'
+          build_file = "kernel_platform/common/BUILD.bazel"
+          with open(build_file, "r") as f:
+              content = f.read()
 
-          for config in "${CUSTOM_CONFIGS[@]}"; do
-            KEY="${config%%=*}"
-            # 移除已存在的同 key 行 (支持 =y/=n/=m/# CONFIG is not set 四种形式)
-            sed -i "/^${KEY}[= ]/d; /^# ${KEY} is not set/d" "$CONFIG_FILE"
-            # 追加新配置
-            echo "$config" >> "$CONFIG_FILE"
-            echo "  + $config"
-          done
+          fragment_line = '        "defconfig_fragments": ["arch/arm64/configs/custom_gki.fragment"],\n'
+
+          # 给 kernel_aarch64 和 kernel_aarch64_16k 加上 defconfig_fragments
+          # 这两个 target 用 define_common_kernels 定义, 在 target_configs 字典里
+          for target in ["kernel_aarch64", "kernel_aarch64_16k"]:
+              marker = '"' + target + '": {\n'
+              idx = content.find(marker)
+              if idx == -1:
+                  print(f"⚠️ {target} not found in BUILD.bazel, skip")
+                  continue
+              insert_pos = idx + len(marker)
+              # 检查这个 target 块里是否已经有 defconfig_fragments
+              # 找到下一个 "}," 作为块结束
+              block_end = content.find('},', insert_pos)
+              block = content[insert_pos:block_end]
+              if "defconfig_fragments" in block:
+                  print(f"✓ {target} already has defconfig_fragments, skip")
+                  continue
+              content = content[:insert_pos] + fragment_line + content[insert_pos:]
+              print(f"✓ Added defconfig_fragments to {target}")
+
+          with open(build_file, "w") as f:
+              f.write(content)
+          PYEOF
 
           echo ""
-          echo "🔧 After patch, grep target configs:"
-          grep -E "CONFIG_(SYSVIPC|POSIX_MQUEUE|IPC_NS|PID_NS)" "$CONFIG_FILE"
-
-          # 同时 patch consolidate.fragment (如果将来切 consolidate 变体也能生效)
-          CONSOLIDATE_FRAGMENT="kernel_platform/common/arch/arm64/configs/consolidate.fragment"
-          if [ -f "$CONSOLIDATE_FRAGMENT" ]; then
-            echo ""
-            echo "🔧 Also patching $CONSOLIDATE_FRAGMENT (for consolidate variant)"
-            for config in "${CUSTOM_CONFIGS[@]}"; do
-              KEY="${config%%=*}"
-              sed -i "/^${KEY}[= ]/d; /^# ${KEY} is not set/d" "$CONSOLIDATE_FRAGMENT"
-              echo "$config" >> "$CONSOLIDATE_FRAGMENT"
-              echo "  + $config (consolidate)"
-            done
-          fi
+          echo "🔧 Verify: grep defconfig_fragments in BUILD.bazel"
+          grep -n "defconfig_fragments" "$BUILD_FILE" | head -10
 
       - name: "🔨 Build Kernel via Official Script"
         run: |
