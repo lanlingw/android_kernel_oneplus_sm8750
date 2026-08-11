@@ -249,8 +249,9 @@ jobs:
           set -euo pipefail
           cd kernel_workspace/kernel_platform
 
-          echo "🔍 Searching for init_boot.img in bazel-bin ..."
-          FOUND_INIT_BOOT=$(find bazel-bin -name "init_boot.img" -type f 2>/dev/null | head -5)
+          echo "🔍 Searching for init_boot.img in bazel-bin (-L follows symlinks)..."
+          # -L: 跟随符号链接. bazel-bin 是符号链接, 不加 -L find 不会进入
+          FOUND_INIT_BOOT=$(find -L bazel-bin -name "init_boot.img" -type f 2>/dev/null | head -5)
 
           mkdir -p ../Final-Image
 
@@ -268,15 +269,24 @@ jobs:
             echo "❌ init_boot.img NOT found in bazel-bin"
             echo ""
             echo "🔍 Searching entire workspace ..."
-            find . -name "init_boot.img" -type f 2>/dev/null | head -10
-            echo ""
-            echo "🔍 Listing bazel-bin/msm-kernel/ contents:"
-            ls -la bazel-bin/msm-kernel/ 2>/dev/null | head -20 || true
-            exit 1
+            FOUND_INIT_BOOT=$(find . -name "init_boot.img" -type f 2>/dev/null | head -5)
+            echo "$FOUND_INIT_BOOT"
+            if [ -n "$FOUND_INIT_BOOT" ]; then
+              INIT_BOOT_PATH=$(echo "$FOUND_INIT_BOOT" | head -1)
+              cp -v "$INIT_BOOT_PATH" ../Final-Image/
+              echo ""
+              echo "📦 init_boot.img info:"
+              ls -la ../Final-Image/init_boot.img
+              file ../Final-Image/init_boot.img
+            else
+              echo "🔍 Listing bazel-bin/msm-kernel/ contents:"
+              ls -la bazel-bin/msm-kernel/ 2>/dev/null | head -20 || true
+              exit 1
+            fi
           fi
 
           # 也收集 boot.img (如果存在) 作为参考
-          FOUND_BOOT=$(find bazel-bin -name "boot.img" -not -name "vendor_boot.img" -not -name "init_boot.img" -type f 2>/dev/null | head -1)
+          FOUND_BOOT=$(find -L bazel-bin -name "boot.img" -not -name "vendor_boot.img" -not -name "init_boot.img" -type f 2>/dev/null | head -1)
           if [ -n "$FOUND_BOOT" ]; then
             cp -v "$FOUND_BOOT" ../Final-Image/
           fi
