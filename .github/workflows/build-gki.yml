@@ -1,23 +1,45 @@
-name: Build OnePlus Pad 2 Pro Pure GKI Kernel (Droidspaces)
+name: Build OnePlus Pad 2 Pro Droidspaces GKI Kernel
 
 on:
   workflow_dispatch:
     inputs:
       TARGET:
-        description: "Kleaf GKI Target (SM8750 通常为 sun)"
+        description: "OnePlus Qualcomm platform target"
         required: false
         type: string
         default: "sun"
+
       VARIANT:
-        description: "Build Variant (gki / perf / debug)"
+        description: "Kernel build variant: gki / perf / debug"
         required: false
-        type: string
+        type: choice
+        options:
+          - gki
+          - perf
+          - debug
         default: "gki"
+
+      APPLY_OPTIONAL_CONFIG:
+        description: "Enable optional Droidspaces GKI configs"
+        required: false
+        type: boolean
+        default: false
+
+      CLEAN_BUILD:
+        description: "Force clean Bazel/output build"
+        required: false
+        type: boolean
+        default: true
+
 
 jobs:
   build:
-    name: Build Pure GKI ${{ inputs.TARGET || 'sun' }}-${{ inputs.VARIANT || 'gki' }}
+    name: >
+      Pad 2 Pro SM8750 Droidspaces
+      ${{ inputs.TARGET || 'sun' }}-${{ inputs.VARIANT || 'gki' }}
+
     runs-on: ubuntu-24.04
+
     timeout-minutes: 480
 
     env:
@@ -25,173 +47,936 @@ jobs:
       VARIANT: ${{ inputs.VARIANT || 'gki' }}
       WORKSPACE: kernel_workspace
 
+      # OnePlus source tree
+      MANIFEST_BRANCH: oneplus/sm8750
+      MANIFEST_FILE: oneplus_pad_2_pro_b.xml
+
+      # Reduce parallelism slightly to avoid CI memory exhaustion.
+      BUILD_JOBS: 8
+
+      # ccache
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 8G
+
+
     steps:
+
+      # ============================================================
+      # 1. Maximize disk space
+      # ============================================================
+
       - name: "🚀 Maximize Build Space"
         uses: easimon/maximize-build-space@master
         with:
           root-reserve-mb: 24576
           temp-reserve-mb: 8192
-          remove-dotnet: 'true'
-          remove-android: 'true'
-          remove-haskell: 'true'
-          remove-codeql: 'true'
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+
+
+      # ============================================================
+      # 2. Install build dependencies
+      # ============================================================
 
       - name: "📦 Install Build Dependencies"
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            python3 python-is-python3 git curl wget ccache \
-            build-essential flex bison libssl-dev libncurses-dev zlib1g-dev \
-            rsync unzip gawk dos2unix bc \
-            libelf-dev pkg-config gcc-aarch64-linux-gnu clang lld llvm \
-            openjdk-17-jdk android-sdk-libsparse-utils \
-            libncurses-dev lib32z1-dev libxml2-utils lzop pngcrush \
-            schedtool squashfs-tools xsltproc yasm cpio repo
+          set -euxo pipefail
 
-      - name: "📥 Init & Sync Official OnePlus Manifest"
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            python3 \
+            python-is-python3 \
+            git \
+            curl \
+            wget \
+            ccache \
+            build-essential \
+            flex \
+            bison \
+            libssl-dev \
+            libncurses-dev \
+            zlib1g-dev \
+            rsync \
+            unzip \
+            gawk \
+            dos2unix \
+            bc \
+            libelf-dev \
+            pkg-config \
+            gcc-aarch64-linux-gnu \
+            clang \
+            lld \
+            llvm \
+            openjdk-17-jdk \
+            android-sdk-libsparse-utils \
+            lib32z1-dev \
+            libxml2-utils \
+            lzop \
+            pngcrush \
+            schedtool \
+            squashfs-tools \
+            xsltproc \
+            yasm \
+            cpio \
+            repo
+
+          echo "=== Tool versions ==="
+
+          python3 --version
+          git --version
+          repo --version || true
+          clang --version
+          ld.lld --version
+          bazel --version || true
+
+
+      # ============================================================
+      # 3. Configure ccache
+      # ============================================================
+
+      - name: "⚡ Configure ccache"
+        shell: bash
         run: |
-          set -euo pipefail
+          set -euxo pipefail
+
+          mkdir -p "$CCACHE_DIR"
+
+          ccache --set-config=cache_dir="$CCACHE_DIR"
+          ccache --set-config=max_size="$CCACHE_MAXSIZE"
+
+          ccache --zero-stats || true
+
+          ccache --show-config
+
+
+      # ============================================================
+      # 4. Restore ccache
+      # ============================================================
+
+      - name: "📦 Restore ccache"
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: >
+            ccache-sm8750-pad2pro-
+            ${{ env.TARGET }}-
+            ${{ env.VARIANT }}-
+            ${{ github.run_id }}
+          restore-keys: |
+            ccache-sm8750-pad2pro-${{ env.TARGET }}-${{ env.VARIANT }}-
+            ccache-sm8750-pad2pro-${{ env.TARGET }}-
+            ccache-sm8750-pad2pro-
+
+
+      # ============================================================
+      # 5. Initialize official OnePlus manifest
+      # ============================================================
+
+      - name: "📥 Init Official OnePlus SM8750 Manifest"
+        shell: bash
+        run: |
+          set -euxo pipefail
+
           mkdir -p "$WORKSPACE"
+
           cd "$WORKSPACE"
-          
-          # 初始化 SM8750 平板源码树
-          repo init -u https://github.com/OnePlusOSS/kernel_manifest.git \
-            -b oneplus/sm8750 \
-            -m oneplus_pad_2_pro_b.xml \
+
+          echo "========================================"
+          echo "OnePlus Kernel Manifest"
+          echo "========================================"
+          echo "Branch : $MANIFEST_BRANCH"
+          echo "Manifest: $MANIFEST_FILE"
+          echo "Target : $TARGET"
+          echo "Variant: $VARIANT"
+          echo "========================================"
+
+          repo init \
+            -u https://github.com/OnePlusOSS/kernel_manifest.git \
+            -b "$MANIFEST_BRANCH" \
+            -m "$MANIFEST_FILE" \
             --depth=1
 
-          repo sync -c -j"$(nproc --all)" --no-tags --no-clone-bundle --force-sync
 
-      - name: "🩹 Apply Droidspaces kABI Patch (Below 6.12)"
+      # ============================================================
+      # 6. Sync source tree
+      # ============================================================
+
+      - name: "📥 Sync OnePlus Kernel Source"
+        shell: bash
         run: |
-          set -euo pipefail
-          echo "⬇️ Fetching Droidspaces-OSS kABI patches..."
-          git clone --depth=1 https://github.com/ravindu644/Droidspaces-OSS.git /tmp/Droidspaces-OSS
-          
-          PATCH_FILE="/tmp/Droidspaces-OSS/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch"
-          COMMON_DIR="$WORKSPACE/kernel_platform/common"
-          
-          if [ -f "$PATCH_FILE" ]; then
-            echo "✅ Applying kABI fix for Linux 6.6..."
-            cd "$COMMON_DIR"
-            patch -p1 < "$PATCH_FILE"
-          else
-            echo "❌ Required kABI patch not found!"
+          set -euxo pipefail
+
+          cd "$WORKSPACE"
+
+          repo sync \
+            -c \
+            -j"$(nproc --all)" \
+            --no-tags \
+            --no-clone-bundle \
+            --force-sync
+
+          echo
+          echo "========================================"
+          echo "Repo status"
+          echo "========================================"
+
+          repo status || true
+
+          echo
+          echo "========================================"
+          echo "Kernel platform"
+          echo "========================================"
+
+          ls -lah kernel_platform
+
+          echo
+          echo "========================================"
+          echo "OPLUS build scripts"
+          echo "========================================"
+
+          find kernel_platform/oplus/build \
+            -maxdepth 2 \
+            -type f \
+            -print | sort
+
+
+      # ============================================================
+      # 7. Verify expected Pad 2 Pro / SM8750 tree
+      # ============================================================
+
+      - name: "🔎 Verify SM8750 / Pad 2 Pro Source Tree"
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd "$WORKSPACE/kernel_platform"
+
+          test -f "oplus/build/oplus_build_kernel.sh"
+          test -f "common/arch/arm64/configs/gki_defconfig"
+
+          echo "✅ OnePlus build wrapper found"
+          echo "✅ GKI defconfig found"
+
+          echo
+          echo "=== SM8750 build configs ==="
+
+          find . \
+            -type f \
+            \( \
+              -name "build.config*" \
+              -o -name "*.bzl" \
+            \) \
+            -print \
+            | grep -Ei 'sun|sm8750|gki|perf' \
+            | head -200 \
+            || true
+
+          echo
+          echo "=== Kernel version ==="
+
+          if [ -f common/Makefile ]; then
+            grep -E \
+              '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)' \
+              common/Makefile \
+              || true
+          fi
+
+          echo
+          echo "=== Check official build wrapper ==="
+
+          ./oplus/build/oplus_build_kernel.sh --help \
+            || true
+
+
+      # ============================================================
+      # 8. Clone Droidspaces
+      # ============================================================
+
+      - name: "📥 Fetch Droidspaces-OSS"
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          rm -rf /tmp/Droidspaces-OSS
+
+          git clone \
+            --depth=1 \
+            https://github.com/ravindu644/Droidspaces-OSS.git \
+            /tmp/Droidspaces-OSS
+
+          echo "Droidspaces revision:"
+          git -C /tmp/Droidspaces-OSS rev-parse HEAD
+
+          echo
+          echo "Available GKI patches:"
+          find \
+            /tmp/Droidspaces-OSS/Documentation/resources/kernel-patches/GKI \
+            -type f \
+            -print \
+            | sort
+
+
+      # ============================================================
+      # 9. Locate correct <6.12 SYSVIPC kABI patch
+      # ============================================================
+
+      - name: "🩹 Locate Droidspaces GKI kABI Patch"
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          PATCH_DIR="/tmp/Droidspaces-OSS/Documentation/resources/kernel-patches/GKI/below-kernel-6.12"
+
+          test -d "$PATCH_DIR"
+
+          echo "Available patches:"
+          find "$PATCH_DIR" \
+            -maxdepth 1 \
+            -type f \
+            -print \
+            | sort
+
+          PATCH_FILE="$(find "$PATCH_DIR" \
+            -maxdepth 1 \
+            -type f \
+            \( \
+              -iname '*sysvipc*kabi*6_7_8*.patch' \
+              -o \
+              -iname '*sysvipc*kABI*6_7_8*.patch' \
+            \) \
+            | head -n 1)"
+
+          if [ -z "$PATCH_FILE" ]; then
+            echo "❌ Could not locate the recommended SYSVIPC kABI patch"
             exit 1
           fi
 
-      - name: "⚙️ Configure gki_defconfig for Droidspaces"
+          echo "PATCH_FILE=$PATCH_FILE" \
+            >> "$GITHUB_ENV"
+
+          echo "✅ Selected:"
+          echo "$PATCH_FILE"
+
+
+      # ============================================================
+      # 10. Apply Droidspaces kABI patch
+      # ============================================================
+
+      - name: "🩹 Apply Droidspaces SYSVIPC kABI Patch"
+        shell: bash
         run: |
-          set -euo pipefail
-          cd "$WORKSPACE/kernel_platform/common"
-          CONFIG_FILE="arch/arm64/configs/gki_defconfig"
-          
-          CONFIGS=(
-            "CONFIG_SYSVIPC=y" "CONFIG_SYSVIPC_SYSCTL=y" "CONFIG_POSIX_MQUEUE=y"
-            "CONFIG_IPC_NS=y" "CONFIG_PID_NS=y" "CONFIG_NET_NS=y" "CONFIG_UTS_NS=y" "CONFIG_USER_NS=y"
-            "CONFIG_CGROUPS=y" "CONFIG_CGROUP_DEVICE=y" "CONFIG_CGROUP_FREEZER=y"
-            "CONFIG_CGROUP_SCHED=y" "CONFIG_CPUSETS=y" "CONFIG_MEMCG=y"
-            "CONFIG_VETH=y" "CONFIG_MACVLAN=y" "CONFIG_BRIDGE=y"
-            "CONFIG_NETFILTER_XT_MATCH_COMMENT=y" "CONFIG_IP_NF_TARGET_MASQUERADE=y"
-            "CONFIG_BINFMT_MISC=y" "CONFIG_OVERLAY_FS=y" "CONFIG_FUSE_FS=y"
+          set -euxo pipefail
+
+          COMMON_DIR="$WORKSPACE/kernel_platform/common"
+
+          cd "$COMMON_DIR"
+
+          echo "Applying:"
+          echo "$PATCH_FILE"
+
+          patch \
+            --forward \
+            -p1 \
+            < "$PATCH_FILE"
+
+          echo
+          echo "=== Verify patch state ==="
+
+          git diff --stat || true
+          git diff --check || true
+
+          echo
+          echo "✅ Droidspaces kABI patch applied"
+
+
+      # ============================================================
+      # 11. Configure GKI defconfig
+      # ============================================================
+
+      - name: "⚙️ Configure Droidspaces GKI Defconfig"
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          COMMON_DIR="$WORKSPACE/kernel_platform/common"
+          CONFIG_FILE="$COMMON_DIR/arch/arm64/configs/gki_defconfig"
+
+          cd "$COMMON_DIR"
+
+          test -f "$CONFIG_FILE"
+
+          echo "Using:"
+          echo "$CONFIG_FILE"
+
+          # --------------------------------------------------------
+          # Required Droidspaces GKI configuration according to
+          # the current Droidspaces GKI guide.
+          #
+          # Do NOT blindly append a huge config list.
+          # Existing GKI settings are preserved.
+          # --------------------------------------------------------
+
+          REQUIRED_CONFIGS=(
+            "CONFIG_SYSVIPC=y"
+            "CONFIG_POSIX_MQUEUE=y"
+            "CONFIG_IPC_NS=y"
+            "CONFIG_PID_NS=y"
+            "CONFIG_DEVTMPFS=y"
+            "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y"
           )
-          
-          echo "📝 Updating $CONFIG_FILE for GKI compliance..."
-          for cfg in "${CONFIGS[@]}"; do
-            key="${cfg%=*}"
-            if grep -q "^# ${key} is not set" "$CONFIG_FILE"; then
-              sed -i "s|^# ${key} is not set|${cfg}|g" "$CONFIG_FILE"
-            elif ! grep -q "^${cfg}" "$CONFIG_FILE"; then
-              echo "${cfg}" >> "$CONFIG_FILE"
+
+          # Optional configs are deliberately disabled by default.
+          # They can be enabled through workflow_dispatch.
+          OPTIONAL_CONFIGS=(
+            "CONFIG_NETFILTER_XT_TARGET_REJECT=y"
+            "CONFIG_NETFILTER_XT_TARGET_LOG=y"
+            "CONFIG_NETFILTER_XT_MATCH_RECENT=y"
+            "CONFIG_IP_SET=y"
+            "CONFIG_IP_SET_HASH_IP=y"
+            "CONFIG_IP_SET_HASH_NET=y"
+            "CONFIG_NETFILTER_XT_SET=y"
+            "CONFIG_TMPFS_POSIX_ACL=y"
+            "CONFIG_TMPFS_XATTR=y"
+          )
+
+          set_config() {
+            local cfg="$1"
+            local key="${cfg%%=*}"
+
+            if grep -qE "^${key}=.*$" "$CONFIG_FILE"; then
+              sed -i \
+                "s|^${key}=.*$|${cfg}|" \
+                "$CONFIG_FILE"
+
+            elif grep -qE "^# ${key} is not set$" "$CONFIG_FILE"; then
+              sed -i \
+                "s|^# ${key} is not set$|${cfg}|" \
+                "$CONFIG_FILE"
+
+            else
+              echo "$cfg" >> "$CONFIG_FILE"
             fi
+          }
+
+          echo
+          echo "=== Required Droidspaces GKI configs ==="
+
+          for cfg in "${REQUIRED_CONFIGS[@]}"; do
+            echo "Enabling: $cfg"
+            set_config "$cfg"
           done
 
-      - name: "🩹 Relax KMI/kABI Strict Checks"
-        run: |
-          set -euo pipefail
-          cd "$WORKSPACE/kernel_platform"
-          
-          # 放宽 GKI 符号列表校验，允许自定义配置通过
-          find . -name "build.config.gki*" -exec sed -i 's/KMI_SYMBOL_LIST_STRICT_MODE=1/KMI_SYMBOL_LIST_STRICT_MODE=0/g' {} + || true
-          find . -name "build.config.gki*" -exec sed -i 's/TRIM_NONLISTED_KMI=1/TRIM_NONLISTED_KMI=0/g' {} + || true
-          
-          python3 - << 'PYEOF'
-          import os
-          path = "common/BUILD.bazel"
-          if os.path.exists(path):
-              with open(path, "r") as f: c = f.read()
-              c = c.replace("kmi_symbol_list_strict_mode = True", "kmi_symbol_list_strict_mode = False")
-              with open(path, "w") as f: f.write(c)
-              print("✅ Relaxed BUILD.bazel kABI strict mode")
-          PYEOF
+          if [ "${{ inputs.APPLY_OPTIONAL_CONFIG }}" = "true" ]; then
+            echo
+            echo "=== Optional Droidspaces configs ==="
 
-      - name: "🔨 Build Pure GKI Kernel via Bazel"
-        run: |
-          set -euo pipefail
-          cd "$WORKSPACE/kernel_platform"
-          
-          # 纯 GKI 构建命令，不加载 vendor 模块
-          # 注意：如果 sun 没有独立的 _gki variant，可尝试 //common:sun_gki 或查看 common/BUILD.bazel
-          BUILD_TARGET="//common:${TARGET}_${VARIANT}"
-          
-          echo "🏗️ Building pure GKI target: $BUILD_TARGET"
-          tools/bazel build "$BUILD_TARGET" \
-            --keep_going \
-            --verbose_failures \
-            2>&1 | tee "$GITHUB_WORKSPACE/build-gki-${TARGET}-${VARIANT}.log"
-
-      - name: "📦 Collect Pure GKI Artifacts"
-        if: always()
-        run: |
-          set -euo pipefail
-          DEST="$GITHUB_WORKSPACE/Final-GKI-Image"
-          mkdir -p "$DEST"
-          
-          # GKI 产物通常在 out/msm-kernel-<target>_<variant>/dist 或 out/common/dist
-          DIST_CANDIDATES=(
-            "$WORKSPACE/kernel_platform/out/msm-kernel-${TARGET}_${VARIANT}/dist"
-            "$WORKSPACE/kernel_platform/out/${TARGET}_${VARIANT}/dist"
-            "$WORKSPACE/kernel_platform/out/common/dist"
-          )
-          
-          DIST=""
-          for d in "${DIST_CANDIDATES[@]}"; do
-            if [ -d "$d" ] && [ -f "$d/Image" ]; then
-              DIST="$d"
-              break
-            fi
-          done
-          
-          if [ -z "$DIST" ]; then
-            echo "⚠️ No valid GKI dist directory found. Listing out/ structure:"
-            find "$WORKSPACE/kernel_platform/out" -maxdepth 3 -type d || true
-            exit 0
+            for cfg in "${OPTIONAL_CONFIGS[@]}"; do
+              echo "Enabling: $cfg"
+              set_config "$cfg"
+            done
+          else
+            echo
+            echo "Optional Droidspaces configs: disabled"
           fi
-          
-          echo "📂 Found GKI dist at: $DIST"
-          cp "$DIST"/Image "$DEST/" 2>/dev/null || true
-          cp "$DIST"/Image.lz4 "$DEST/" 2>/dev/null || true
-          cp "$DIST"/boot.img "$DEST/" 2>/dev/null || true
-          cp "$DIST"/system_dlkm*.img "$DEST/" 2>/dev/null || true
-          cp "$DIST"/vmlinux "$DEST/" 2>/dev/null || true
-          cp "$DIST"/System.map "$DEST/" 2>/dev/null || true
-          cp "$DIST"/.config "$DEST/" 2>/dev/null || true
-          
-          echo "Artifact layout:"
-          ls -lhR "$DEST" || true
 
-      - name: "📤 Upload GKI Artifacts"
+          echo
+          echo "=== Resulting Droidspaces config ==="
+
+          for cfg in \
+            SYSVIPC \
+            POSIX_MQUEUE \
+            IPC_NS \
+            PID_NS \
+            DEVTMPFS \
+            NETFILTER_XT_MATCH_ADDRTYPE \
+            NETFILTER_XT_TARGET_REJECT \
+            NETFILTER_XT_TARGET_LOG \
+            NETFILTER_XT_MATCH_RECENT \
+            IP_SET \
+            IP_SET_HASH_IP \
+            IP_SET_HASH_NET \
+            NETFILTER_XT_SET \
+            TMPFS_POSIX_ACL \
+            TMPFS_XATTR
+          do
+            grep -E \
+              "^CONFIG_${cfg}=|^# CONFIG_${cfg} is not set" \
+              "$CONFIG_FILE" \
+              || true
+          done
+
+          echo
+          echo "=== Defconfig diff ==="
+
+          git diff -- \
+            arch/arm64/configs/gki_defconfig \
+            || true
+
+
+      # ============================================================
+      # 12. DO NOT disable KMI strict checks
+      # ============================================================
+
+      - name: "🔐 Verify GKI KMI Settings"
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd "$WORKSPACE/kernel_platform"
+
+          echo "Checking KMI configuration."
+
+          echo
+          echo "=== KMI related settings ==="
+
+          grep -R \
+            -n \
+            -E \
+            'KMI_SYMBOL_LIST_STRICT_MODE|TRIM_NONLISTED_KMI|kmi_symbol_list_strict_mode' \
+            . \
+            --exclude-dir=.git \
+            2>/dev/null \
+            | head -200 \
+            || true
+
+          echo
+          echo "ℹ️ KMI checks are intentionally NOT disabled."
+          echo "ℹ️ Droidspaces kABI patch is expected to preserve GKI ABI compatibility."
+
+
+      # ============================================================
+      # 13. Validate defconfig before expensive build
+      # ============================================================
+
+      - name: "🧪 Validate GKI Defconfig"
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd "$WORKSPACE/kernel_platform/common"
+
+          echo "Running basic configuration validation."
+
+          make \
+            ARCH=arm64 \
+            LLVM=1 \
+            O=out-droidspaces \
+            gki_defconfig
+
+          echo
+          echo "=== Validated .config ==="
+
+          for cfg in \
+            SYSVIPC \
+            POSIX_MQUEUE \
+            IPC_NS \
+            PID_NS \
+            DEVTMPFS \
+            NETFILTER_XT_MATCH_ADDRTYPE
+          do
+            grep \
+              -E \
+              "^CONFIG_${cfg}=y$" \
+              out-droidspaces/.config
+          done
+
+          echo
+          echo "=== Kernel version from generated config ==="
+
+          grep -E \
+            '^CONFIG_LOCALVERSION=' \
+            out-droidspaces/.config \
+            || true
+
+
+      # ============================================================
+      # 14. Inspect official build wrapper / available targets
+      # ============================================================
+
+      - name: "🔎 Inspect OnePlus Build Targets"
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd "$WORKSPACE/kernel_platform"
+
+          echo "========================================"
+          echo "Potential Bazel targets"
+          echo "========================================"
+
+          tools/bazel query \
+            '//common:*' \
+            2>/dev/null \
+            | grep -Ei \
+              'sun|gki|perf|debug|kernel.*dist|dist' \
+            | tee "$GITHUB_WORKSPACE/bazel-targets.txt" \
+            || true
+
+          echo
+          echo "========================================"
+          echo "Build config files"
+          echo "========================================"
+
+          find . \
+            -type f \
+            -name 'build.config*' \
+            -print \
+            | sort \
+            | grep -Ei 'sun|gki|perf|debug|msm' \
+            | tee "$GITHUB_WORKSPACE/build-config-files.txt" \
+            || true
+
+
+      # ============================================================
+      # 15. Build using OnePlus official wrapper
+      # ============================================================
+
+      - name: "🔨 Build OnePlus SM8750 Kernel"
+        shell: bash
+        run: |
+          set -o pipefail
+
+          cd "$WORKSPACE/kernel_platform"
+
+          echo "========================================"
+          echo "Starting OnePlus kernel build"
+          echo "========================================"
+
+          echo "TARGET : $TARGET"
+          echo "VARIANT: $VARIANT"
+          echo "JOBS   : $BUILD_JOBS"
+
+          echo
+          echo "Build command:"
+          echo "./oplus/build/oplus_build_kernel.sh $TARGET $VARIANT"
+
+          echo
+
+          if [ "${{ inputs.CLEAN_BUILD }}" = "true" ]; then
+            echo "Clean build requested."
+
+            rm -rf out/.cache \
+                   out/bazel \
+                   out/msm-kernel-* \
+                   out/common \
+                   out/dist \
+                   2>/dev/null || true
+          fi
+
+          ./oplus/build/oplus_build_kernel.sh \
+            "$TARGET" \
+            "$VARIANT" \
+            2>&1 \
+            | tee "$GITHUB_WORKSPACE/build-${TARGET}-${VARIANT}.log"
+
+          BUILD_EXIT=${PIPESTATUS[0]}
+
+          if [ "$BUILD_EXIT" -ne 0 ]; then
+            echo
+            echo "❌ OnePlus kernel build failed."
+            echo "Exit code: $BUILD_EXIT"
+
+            exit "$BUILD_EXIT"
+          fi
+
+          echo
+          echo "✅ Kernel build completed."
+
+
+      # ============================================================
+      # 16. Locate output artifacts
+      # ============================================================
+
+      - name: "📦 Locate Kernel Artifacts"
+        if: always()
+        shell: bash
+        run: |
+          set -u
+
+          ROOT="$WORKSPACE/kernel_platform"
+          DEST="$GITHUB_WORKSPACE/Final-GKI-Image"
+
+          mkdir -p "$DEST"
+
+          echo "========================================"
+          echo "Searching kernel artifacts"
+          echo "========================================"
+
+          if [ ! -d "$ROOT/out" ]; then
+            echo "⚠️ No kernel_platform/out directory."
+          else
+            echo
+            echo "=== dist directories ==="
+
+            find "$ROOT/out" \
+              -type d \
+              -name dist \
+              -print \
+              | sort \
+              || true
+
+            echo
+            echo "=== Image files ==="
+
+            find "$ROOT/out" \
+              -type f \
+              \( \
+                -name Image \
+                -o -name Image.lz4 \
+                -o -name Image.gz \
+                -o -name Image.gz-dtb \
+                -o -name boot.img \
+                -o -name vendor_boot.img \
+                -o -name vendor_kernel_boot.img \
+                -o -name system_dlkm.img \
+                -o -name system_dlkm.flatten.erofs.img \
+                -o -name vendor_dlkm.img \
+                -o -name dtbo.img \
+                -o -name vmlinux \
+                -o -name System.map \
+                -o -name .config \
+              \) \
+              -print \
+              | sort \
+              | tee "$GITHUB_WORKSPACE/found-artifacts.txt" \
+              || true
+          fi
+
+          echo
+          echo "========================================"
+          echo "Collecting dist artifacts"
+          echo "========================================"
+
+          # Prefer official OnePlus out/dist directories.
+          DIST_DIRS="$(find "$ROOT/out" \
+            -type d \
+            -name dist \
+            -print \
+            2>/dev/null || true)"
+
+          if [ -n "$DIST_DIRS" ]; then
+            while IFS= read -r DIST; do
+              [ -d "$DIST" ] || continue
+
+              echo "Collecting: $DIST"
+
+              cp -a "$DIST"/. \
+                "$DEST/" \
+                2>/dev/null || true
+
+            done <<< "$DIST_DIRS"
+          fi
+
+          echo
+          echo "========================================"
+          echo "Collecting key artifacts from out/"
+          echo "========================================"
+
+          while IFS= read -r FILE; do
+            [ -f "$FILE" ] || continue
+
+            REL="${FILE#$ROOT/out/}"
+
+            # Avoid overwriting files with identical names from
+            # different output directories.
+            SAFE_NAME="$(echo "$REL" | tr '/' '_')"
+
+            cp -f \
+              "$FILE" \
+              "$DEST/$SAFE_NAME" \
+              2>/dev/null || true
+
+          done < <(
+            find "$ROOT/out" \
+              -type f \
+              \( \
+                -name Image \
+                -o -name Image.lz4 \
+                -o -name Image.gz \
+                -o -name boot.img \
+                -o -name vendor_boot.img \
+                -o -name vendor_kernel_boot.img \
+                -o -name system_dlkm.img \
+                -o -name system_dlkm.flatten.erofs.img \
+                -o -name vendor_dlkm.img \
+                -o -name dtbo.img \
+                -o -name vmlinux \
+                -o -name System.map \
+                -o -name .config \
+              \) \
+              -print
+          )
+
+          echo
+          echo "========================================"
+          echo "Final artifact directory"
+          echo "========================================"
+
+          find "$DEST" \
+            -maxdepth 2 \
+            -type f \
+            -printf '%p %s bytes\n' \
+            | sort \
+            || true
+
+
+      # ============================================================
+      # 17. Verify actual build result
+      # ============================================================
+
+      - name: "🧪 Verify Build Artifacts"
+        if: always()
+        shell: bash
+        run: |
+          set -u
+
+          DEST="$GITHUB_WORKSPACE/Final-GKI-Image"
+
+          echo "Checking final artifacts..."
+
+          if [ ! -d "$DEST" ]; then
+            echo "❌ Artifact directory does not exist."
+            exit 1
+          fi
+
+          echo
+          echo "Files:"
+          find "$DEST" \
+            -type f \
+            -printf '%f %s bytes\n' \
+            | sort
+
+          # At minimum we expect an Image or a boot image.
+          IMAGE_FOUND=0
+
+          for f in \
+            "$DEST/Image" \
+            "$DEST/Image.lz4" \
+            "$DEST/Image.gz" \
+            "$DEST/Image.gz-dtb" \
+            "$DEST/boot.img"
+          do
+            if [ -s "$f" ]; then
+              echo "✅ Found valid kernel artifact: $f"
+              IMAGE_FOUND=1
+            fi
+          done
+
+          if [ "$IMAGE_FOUND" -eq 0 ]; then
+            echo
+            echo "❌ No usable kernel Image/boot.img was found."
+            echo
+            echo "This means the build either failed before producing"
+            echo "the expected dist artifacts or the selected variant"
+            echo "uses a different output format."
+
+            exit 1
+          fi
+
+          echo
+          echo "✅ Kernel artifact validation passed."
+
+
+      # ============================================================
+      # 18. Generate build metadata
+      # ============================================================
+
+      - name: "📝 Generate Build Metadata"
+        if: always()
+        shell: bash
+        run: |
+          set -u
+
+          DEST="$GITHUB_WORKSPACE/Final-GKI-Image"
+
+          {
+            echo "========================================"
+            echo "OnePlus Pad 2 Pro Droidspaces Kernel"
+            echo "========================================"
+            echo
+            echo "Manifest branch : $MANIFEST_BRANCH"
+            echo "Manifest file   : $MANIFEST_FILE"
+            echo "Target          : $TARGET"
+            echo "Variant         : $VARIANT"
+            echo
+            echo "Droidspaces:"
+            echo "  SYSVIPC       = y"
+            echo "  POSIX_MQUEUE  = y"
+            echo "  IPC_NS        = y"
+            echo "  PID_NS        = y"
+            echo "  DEVTMPFS      = y"
+            echo "  ADDRTYPE      = y"
+            echo
+            echo "Optional configs:"
+            echo "  enabled       = ${{ inputs.APPLY_OPTIONAL_CONFIG }}"
+            echo
+            echo "Droidspaces revision:"
+            git -C /tmp/Droidspaces-OSS rev-parse HEAD \
+              2>/dev/null || true
+            echo
+            echo "Source repo revisions:"
+            cd "$WORKSPACE"
+            repo forall -c \
+              'printf "%s " "$REPO_PATH"; git rev-parse HEAD' \
+              2>/dev/null \
+              | sort \
+              | head -500 \
+              || true
+          } > "$DEST/BUILD_INFO.txt"
+
+          echo "Generated BUILD_INFO.txt"
+
+
+      # ============================================================
+      # 19. Upload kernel artifacts
+      # ============================================================
+
+      - name: "📤 Upload Kernel Artifacts"
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pure_gki_pad2pro_${{ env.TARGET }}_${{ env.VARIANT }}
-          path: Final-GKI-Image
-          retention-days: 7
+          name: >
+            oneplus_pad_2_pro_sm8750_droidspaces_
+            ${{ env.TARGET }}_
+            ${{ env.VARIANT }}
+          path: |
+            Final-GKI-Image/**
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 6
+
+
+      # ============================================================
+      # 20. Upload build log
+      # ============================================================
 
       - name: "📤 Upload Build Log"
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gki_build_log_${{ env.TARGET }}_${{ env.VARIANT }}
-          path: build-gki-${{ env.TARGET }}-${{ env.VARIANT }}.log
-          retention-days: 3
+          name: >
+            oneplus_pad_2_pro_sm8750_build_log_
+            ${{ env.TARGET }}_
+            ${{ env.VARIANT }}
+          path: |
+            build-${{ env.TARGET }}-${{ env.VARIANT }}.log
+            bazel-targets.txt
+            build-config-files.txt
+            found-artifacts.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+
+      # ============================================================
+      # 21. ccache statistics
+      # ============================================================
+
+      - name: "📊 ccache Statistics"
+        if: always()
+        shell: bash
+        run: |
+          ccache --show-stats || true
