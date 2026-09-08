@@ -65,11 +65,9 @@ jobs:
           export EXTRA_KBUILD_ARGS="--skip_abi --kmi_symbol_list_strict_mode=false"
           export TRIM_NONLISTED_KMI=0
 
-          # 传入 -t sun perf 参数，并通过 -s 指定仅构建 GKI 内核目标
-          python3 build_with_bazel.py \
-            -t sun perf \
-            -s //common:kernel_aarch64_dist \
-            --out_dir "$PWD/out/gki" \
+          # 使用 Kleaf 原生 Bazel 直接编译并复制 GKI 产物到 out 目录
+          tools/bazel run //common:kernel_aarch64_dist -- \
+            --dist_dir="$PWD/out/gki/dist" \
             2>&1 | tee "$GITHUB_WORKSPACE/build-boot-img.log"
 
       - name: "📦 Collect boot.img Artifacts"
