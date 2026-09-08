@@ -32,7 +32,7 @@ jobs:
             rsync unzip gawk dos2unix bc \
             libelf-dev pkg-config gcc-aarch64-linux-gnu clang lld llvm \
             openjdk-17-jdk android-sdk-libsparse-utils \
-            lib32ncurses5-dev lib32z1-dev libxml2-utils lzop pngcrush \
+            libncurses-dev lib32z1-dev libxml2-utils lzop pngcrush \
             schedtool squashfs-tools xsltproc yasm cpio
 
       - name: "📥 Install Repo Tool"
