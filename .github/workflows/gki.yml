@@ -1,0 +1,113 @@
+name: GKI boot.img Only
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build GKI boot.img Only
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      WORKSPACE: kernel_workspace
+
+    steps:
+      - name: "🚀 Maximize Build Space"
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 24576
+          temp-reserve-mb: 8192
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - name: "📦 Install Build Dependencies"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            python3 python-is-python3 git curl wget ccache \
+            build-essential flex bison libssl-dev libncurses-dev zlib1g-dev \
+            rsync unzip gawk dos2unix bc \
+            libelf-dev pkg-config gcc-aarch64-linux-gnu clang lld llvm \
+            openjdk-17-jdk android-sdk-libsparse-utils \
+            lib32ncurses5-dev lib32z1-dev libxml2-utils lzop pngcrush \
+            schedtool squashfs-tools xsltproc yasm cpio
+
+      - name: "📥 Install Repo Tool"
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
+          chmod a+x ~/repo
+          sudo mv ~/repo /usr/local/bin/repo
+          repo --version
+
+      - name: "📥 Init & Sync Official OnePlus Manifest"
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORKSPACE"
+          cd "$WORKSPACE"
+          repo init -u https://github.com/OnePlusOSS/kernel_manifest.git \
+            -b oneplus/sm8750 \
+            -m oneplus_pad_2_pro_b.xml \
+            --depth=1
+
+          repo sync -c -j"$(nproc --all)" --no-tags --no-clone-bundle --force-sync
+
+      - name: "🔨 Build GKI boot.img Only (Skip Vendor Modules)"
+        run: |
+          set -euo pipefail
+          cd "$WORKSPACE/kernel_platform"
+
+          # 禁用 KMI 符号裁剪与 ABI 严格校验
+          export EXTRA_KBUILD_ARGS="--skip_abi --kmi_symbol_list_strict_mode=false"
+          export TRIM_NONLISTED_KMI=0
+
+          # 直接构建通用 GKI 内核目标，不触发 vendor 驱动与镜像的编译
+          python3 build_with_bazel.py \
+            //common:kernel_aarch64_dist \
+            --out_dir "$PWD/out/gki" \
+            2>&1 | tee "$GITHUB_WORKSPACE/build-boot-img.log"
+
+      - name: "📦 Collect boot.img Artifacts"
+        if: always()
+        run: |
+          set -euo pipefail
+          DIST="$WORKSPACE/kernel_platform/out/gki/dist"
+          DEST="$GITHUB_WORKSPACE/Final-Image"
+          mkdir -p "$DEST"
+
+          if [ ! -d "$DIST" ]; then
+            echo "dist directory missing, nothing to collect"
+            exit 0
+          fi
+
+          for f in boot.img init_boot.img Image Image.gz Image.lz4 vmlinux System.map .config; do
+            if [ -f "$DIST/$f" ]; then
+              cp "$DIST/$f" "$DEST/$(basename "$f")"
+              echo "Copied: $f"
+            fi
+          done
+
+          echo "Artifact layout:"
+          find "$DEST" -maxdepth 2 -type f | sort | sed 's#^# - #' || true
+
+      - name: "📤 Upload Boot Images & Kernel"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OnePlus_Pad_2_Pro_GKI_boot_img
+          path: |
+            Final-Image
+          retention-days: 7
+
+      - name: "📤 Upload Build Log"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build_log_boot_img
+          path: |
+            build-boot-img.log
+          retention-days: 3
