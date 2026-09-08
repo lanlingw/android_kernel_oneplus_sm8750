@@ -1,4 +1,4 @@
-name: GKI boot.img Only
+name: Build GKI boot.img Only
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
 jobs:
   build:
     name: Build GKI boot.img Only
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 180
 
     env:
@@ -65,9 +65,10 @@ jobs:
           export EXTRA_KBUILD_ARGS="--skip_abi --kmi_symbol_list_strict_mode=false"
           export TRIM_NONLISTED_KMI=0
 
-          # 直接构建通用 GKI 内核目标，不触发 vendor 驱动与镜像的编译
+          # 传入 -t sun perf 参数，并通过 -s 指定仅构建 GKI 内核目标
           python3 build_with_bazel.py \
-            //common:kernel_aarch64_dist \
+            -t sun perf \
+            -s //common:kernel_aarch64_dist \
             --out_dir "$PWD/out/gki" \
             2>&1 | tee "$GITHUB_WORKSPACE/build-boot-img.log"
 
