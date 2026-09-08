@@ -13,11 +13,6 @@ on:
         required: false
         type: string
         default: "perf"
-      CUSTOM_CONFIG:
-        description: "可选：追加到 arch/arm64/configs/vendor/sun_perf.config 的自定义配置（逗号分隔，如 CONFIG_SYSVIPC=y）"
-        required: false
-        type: string
-        default: "CONFIG_SYSVIPC=y,CONFIG_POSIX_MQUEUE=y,CONFIG_IPC_NS=y,CONFIG_PID_NS=y"
 
 jobs:
   build:
@@ -28,12 +23,10 @@ jobs:
     env:
       TARGET: ${{ inputs.TARGET }}
       VARIANT: ${{ inputs.VARIANT }}
-      CUSTOM_CONFIG: ${{ inputs.CUSTOM_CONFIG }}
       WORKSPACE: kernel_workspace
-      ACK_DIR: kernel_workspace/kernel_platform
 
     steps:
-      - name: "Maximize Build Space"
+      - name: "🚀 Maximize Build Space"
         uses: easimon/maximize-build-space@master
         with:
           root-reserve-mb: 24576
@@ -43,31 +36,28 @@ jobs:
           remove-haskell: 'true'
           remove-codeql: 'true'
 
-      - name: "Install Build Dependencies"
+      - name: "📦 Install Build Dependencies"
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            python3 python3-pip git curl \
-            rsync unzip zip bc bison flex \
-            libssl-dev libelf-dev libncurses-dev zlib1g-dev \
-            pkg-config openjdk-17-jdk
+            python3 python-is-python3 git curl wget ccache \
+            build-essential flex bison libssl-dev libncurses-dev zlib1g-dev \
+            rsync unzip gawk dos2unix bc \
+            libelf-dev pkg-config gcc-aarch64-linux-gnu clang lld llvm \
+            openjdk-17-jdk android-sdk-libsparse-utils \
+            lib32ncurses5-dev lib32z1-dev libxml2-utils lzop pngcrush \
+            schedtool squashfs-tools xsltproc yasm cpio
 
-      - name: "Install Bazelisk (reads kernel_platform/.bazelversion)"
+      - name: "📥 Install Repo Tool"
         run: |
-          version=$(curl -fsSL https://api.github.com/repos/bazelbuild/bazelisk/releases/latest | grep -oP '"tag_name":\s*"v\K[^"]+')
-          curl -fsSL "https://github.com/bazelbuild/bazelisk/releases/download/v${version}/bazelisk-linux-amd64" -o bazelisk
-          chmod +x bazelisk
-          sudo mv bazelisk /usr/local/bin/bazel
-          bazel --version || true
-
-      - name: "Install Repo Tool"
-        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
           curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
           chmod a+x ~/repo
           sudo mv ~/repo /usr/local/bin/repo
           repo --version
 
-      - name: "Init & Sync Official OnePlus Manifest"
+      - name: "📥 Init & Sync Official OnePlus Manifest"
         run: |
           set -euo pipefail
           mkdir -p "$WORKSPACE"
@@ -83,54 +73,23 @@ jobs:
           ls -la
           echo "kernel_platform:"
           ls -la kernel_platform/
-          echo "oplus build scripts:"
-          ls -la kernel_platform/oplus/build/ | head
 
-      - name: "Apply optional custom config fragment"
+      - name: "🔨 Build kernel via official script (Disabled KMI Optimization)"
         run: |
           set -euo pipefail
-          if [ -n "$CUSTOM_CONFIG" ]; then
-            CONFIG_FILE="$ACK_DIR/msm-kernel/arch/arm64/configs/vendor/${TARGET}_${VARIANT}.config"
-            if [ -f "$CONFIG_FILE" ]; then
-              IFS=',' read -ra CFGS <<< "$CUSTOM_CONFIG"
-              for cfg in "${CFGS[@]}"; do
-                cfg="$(echo "$cfg" | tr -d '[:space:]')"
-                [ -z "$cfg" ] && continue
-                key="${cfg%%=*}"
-                grep -q "^${key}=" "$CONFIG_FILE" && sed -i "s|^${key}=.*|${cfg}|" "$CONFIG_FILE" \
-                  || echo "$cfg" >> "$CONFIG_FILE"
-                echo "applied: $cfg"
-              done
-            else
-              echo "custom config skipped: $CONFIG_FILE not found"
-            fi
-          fi
+          cd "$WORKSPACE"
 
-      - name: "Build kernel via official Kleaf (build_with_bazel.py -t TARGET VARIANT)"
-        run: |
-          set -euo pipefail
-          cd "$ACK_DIR"
+          # 禁用 KMI 符号裁剪与 ABI 严格校验
+          export EXTRA_KBUILD_ARGS="--skip_abi --kmi_symbol_list_strict_mode=false"
+          export TRIM_NONLISTED_KMI=0
 
-          # JAVA_HOME: oplus scripts expect jdk21 at TOPDIR/prebuilts/jdk/jdk21, but the
-          # manifest only ships jdk11; bazel ships its own JDK so build does not depend on it.
-          export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
-          export PATH="/usr/local/bin:$PATH"
+          ./kernel_platform/oplus/build/oplus_build_kernel.sh "${TARGET}" "${VARIANT}" 2>&1 | tee "$GITHUB_WORKSPACE/build-kernel-${TARGET}-${VARIANT}.log"
 
-          # official core build command (same as oplus_build_kernel.sh/prepare_vendor.sh invokes)
-          python3 build_with_bazel.py \
-            -t "$TARGET" "$VARIANT" \
-            --out_dir "$PWD/out/msm-kernel-${TARGET}-${VARIANT}" \
-            2>&1 | tee "$GITHUB_WORKSPACE/build-kernel-${TARGET}-${VARIANT}.log"
-
-          echo
-          echo "=== dist output ==="
-          ls -la "$PWD/out/msm-kernel-${TARGET}-${VARIANT}/dist/" || true
-
-      - name: "Collect dist artifacts"
+      - name: "📦 Collect dist artifacts"
         if: always()
         run: |
           set -euo pipefail
-          DIST="$ACK_DIR/out/msm-kernel-${TARGET}-${VARIANT}/dist"
+          DIST="$WORKSPACE/kernel_platform/out/msm-kernel-${TARGET}-${VARIANT}/dist"
           DEST="$GITHUB_WORKSPACE/Final-Image"
           mkdir -p "$DEST/modules" "$DEST/dtb"
 
@@ -139,7 +98,7 @@ jobs:
             exit 0
           fi
 
-          for f in boot.img init_boot.img vendor_boot.img Image Image.gz Image.lz4 \
+          for f in boot.img init_boot.img vendor_boot.img vendor_dlkm.img dtbo.img Image Image.gz Image.lz4 \
                    vmlinux System.map .config; do
             if [ -f "$DIST/$f" ]; then
               cp "$DIST/$f" "$DEST/$(basename "$f")"
@@ -155,7 +114,7 @@ jobs:
           echo "Artifact layout:"
           find "$DEST" -maxdepth 2 -type f | sort | sed 's#^# - #' || true
 
-      - name: "Upload Kernel Artifacts"
+      - name: "📤 Upload Kernel Artifacts"
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -164,7 +123,7 @@ jobs:
             Final-Image
           retention-days: 7
 
-      - name: "Upload Build Log"
+      - name: "📤 Upload Build Log"
         if: always()
         uses: actions/upload-artifact@v4
         with:
