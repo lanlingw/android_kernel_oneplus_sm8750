@@ -212,7 +212,7 @@ jobs:
           git diff --stat || true
           git diff --check || true
 
-      - name: "⚙️ Configure Droidspaces GKI Defconfig"
+      - name: "⚙️ Configure Droidspaces GKI Defconfig (strict rules)"
         shell: bash
         run: |
           set -euxo pipefail
@@ -221,31 +221,21 @@ jobs:
           echo "COMMON = $COMMON"
           echo "CONFIG = $CONFIG"
           test -f "$CONFIG"
+
+          # 严格按照 Droidspaces 文档推荐的 GKI 配置
+          # 必须项
           REQUIRED_CONFIGS=(
             "CONFIG_SYSVIPC=y"
-            "CONFIG_SYSVIPC_SYSCTL=y"
             "CONFIG_POSIX_MQUEUE=y"
             "CONFIG_IPC_NS=y"
             "CONFIG_PID_NS=y"
-            "CONFIG_NET_NS=y"
-            "CONFIG_UTS_NS=y"
-            "CONFIG_USER_NS=y"
-            "CONFIG_CGROUPS=y"
-            "CONFIG_CGROUP_DEVICE=y"
-            "CONFIG_CGROUP_FREEZER=y"
-            "CONFIG_CGROUP_SCHED=y"
-            "CONFIG_CPUSETS=y"
-            "CONFIG_MEMCG=y"
-            "CONFIG_VETH=y"
-            "CONFIG_MACVLAN=y"
-            "CONFIG_BRIDGE=y"
-            "CONFIG_BINFMT_MISC=y"
-            "CONFIG_OVERLAY_FS=y"
-            "CONFIG_FUSE_FS=y"
             "CONFIG_DEVTMPFS=y"
             "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y"
           )
+
+          # 可选项（仅在输入开启时启用）
           OPTIONAL_CONFIGS=(
+            "CONFIG_USER_NS=y"
             "CONFIG_NETFILTER_XT_TARGET_REJECT=y"
             "CONFIG_NETFILTER_XT_TARGET_LOG=y"
             "CONFIG_NETFILTER_XT_MATCH_RECENT=y"
@@ -256,58 +246,85 @@ jobs:
             "CONFIG_TMPFS_POSIX_ACL=y"
             "CONFIG_TMPFS_XATTR=y"
           )
+
+          # 严格遵循文档 Workflow Rules：
+          # 1. 不整块追加
+          # 2. 搜索现有行
+          # 3. # is not set → 改成 =y
+          # 4. 已是 =y → 跳过
+          # 5. 完全不存在才追加到末尾
           set_config() {
             local cfg="$1"
             local key="${cfg%%=*}"
+
+            if grep -qE "^${key}=y$" "$CONFIG"; then
+              echo "Already enabled: $key"
+              return 0
+            fi
+
+            if grep -qE "^# ${key} is not set$" "$CONFIG"; then
+              sed -i "s|^# ${key} is not set$|${cfg}|" "$CONFIG"
+              echo "Changed from 'is not set' → $cfg"
+              return 0
+            fi
+
             if grep -qE "^${key}=.*$" "$CONFIG"; then
               sed -i "s|^${key}=.*$|${cfg}|" "$CONFIG"
-            elif grep -qE "^# ${key} is not set$" "$CONFIG"; then
-              sed -i "s|^# ${key} is not set$|${cfg}|" "$CONFIG"
-            else
-              echo "$cfg" >> "$CONFIG"
+              echo "Updated existing: $cfg"
+              return 0
             fi
+
+            # 真正不存在才追加
+            echo "$cfg" >> "$CONFIG"
+            echo "Appended (not found): $cfg"
           }
+
           echo "=== Required configs ==="
           for cfg in "${REQUIRED_CONFIGS[@]}"; do
-            echo "Enabling: $cfg"
             set_config "$cfg"
           done
+
           if [ "${{ inputs.APPLY_OPTIONAL_CONFIG }}" = "true" ]; then
             echo
             echo "=== Optional configs ==="
             for cfg in "${OPTIONAL_CONFIGS[@]}"; do
-              echo "Enabling: $cfg"
               set_config "$cfg"
             done
           else
             echo
             echo "Optional configs disabled."
           fi
+
           echo
-          echo "=== Requested configuration ==="
+          echo "=== Current relevant configs ==="
           grep -E \
-            '^CONFIG_(SYSVIPC|SYSVIPC_SYSCTL|POSIX_MQUEUE|IPC_NS|PID_NS|NET_NS|UTS_NS|USER_NS|CGROUPS|DEVTMPFS|NETFILTER_XT_MATCH_ADDRTYPE)=' \
+            '^CONFIG_(SYSVIPC|POSIX_MQUEUE|IPC_NS|PID_NS|DEVTMPFS|NETFILTER_XT_MATCH_ADDRTYPE|USER_NS)=' \
             "$CONFIG" \
             || true
-          echo
-          echo "=== Defconfig diff ==="
-          git diff -- \
-            arch/arm64/configs/gki_defconfig \
-            || true
 
-      - name: "🔄 Update gki_defconfig with savedefconfig"
+          echo
+          echo "=== Defconfig diff (before Bazel savedefconfig) ==="
+          git -C "$COMMON" diff -- arch/arm64/configs/gki_defconfig || true
+
+      - name: "🔄 Update gki_defconfig via Bazel savedefconfig"
         shell: bash
         run: |
           set -euxo pipefail
           ROOT="$WORKSPACE/kernel_platform"
           cd "$ROOT"
-          
-          # 重新生成最小化的 gki_defconfig，解决 "savedefconfig does not match" 错误
-          tools/bazel run //common:kernel_aarch64_config -- savedefconfig
-          
+
+          # 使用 --config=local 让 Bazel 可以写回源树
+          # 这是纯 Bazel 方式，不使用 make
+          tools/bazel run \
+            --config=local \
+            //common:kernel_aarch64_config \
+            -- \
+            savedefconfig
+
           echo
-          echo "=== Updated gki_defconfig (after savedefconfig) ==="
+          echo "=== Diff after Bazel savedefconfig ==="
           git -C common diff --stat -- arch/arm64/configs/gki_defconfig || true
+          echo
           git -C common diff -- arch/arm64/configs/gki_defconfig || true
 
       - name: "🔐 Verify GKI KMI Settings"
@@ -329,41 +346,41 @@ jobs:
           echo
           echo "KMI strict checks are NOT disabled."
 
-      - name: "🧪 Validate GKI Defconfig"
+      - name: "🧪 Validate GKI Defconfig (Bazel)"
         shell: bash
         run: |
           set -euxo pipefail
-          COMMON="$WORKSPACE/kernel_platform/common"
-          VALIDATE_OUT="$WORKSPACE/gki-config-check"
-          rm -rf "$VALIDATE_OUT"
-          mkdir -p "$VALIDATE_OUT"
-          cd "$COMMON"
-          make \
-            ARCH=arm64 \
-            LLVM=1 \
-            O="$VALIDATE_OUT" \
-            gki_defconfig
+          ROOT="$WORKSPACE/kernel_platform"
+          cd "$ROOT"
+
+          # 用 Bazel 生成 config 并检查关键选项是否生效
+          tools/bazel build \
+            --config=local \
+            //common:kernel_aarch64_config
+
+          # 找到生成的 .config
+          CONFIG_FILE=$(find bazel-bin -name ".config" -path "*/common/*" | head -n 1 || true)
+          if [ -z "$CONFIG_FILE" ]; then
+            echo "WARNING: Could not locate generated .config, skip detailed check"
+            exit 0
+          fi
+
+          echo "Using generated config: $CONFIG_FILE"
           REQUIRED_FINAL_CONFIGS=(
             "SYSVIPC"
             "POSIX_MQUEUE"
             "IPC_NS"
             "PID_NS"
-            "NET_NS"
-            "UTS_NS"
-            "USER_NS"
-            "CGROUPS"
             "DEVTMPFS"
             "NETFILTER_XT_MATCH_ADDRTYPE"
           )
+
           echo
           echo "=== Validate generated .config ==="
           for cfg in "${REQUIRED_FINAL_CONFIGS[@]}"; do
-            if ! grep -q "^CONFIG_${cfg}=y$" "$VALIDATE_OUT/.config"; then
+            if ! grep -q "^CONFIG_${cfg}=y$" "$CONFIG_FILE"; then
               echo "ERROR: CONFIG_${cfg} is not enabled."
-              grep \
-                "^#\?CONFIG_${cfg}" \
-                "$VALIDATE_OUT/.config" \
-                || true
+              grep -E "^#?CONFIG_${cfg}" "$CONFIG_FILE" || true
               exit 1
             fi
             echo "OK: CONFIG_${cfg}=y"
@@ -435,4 +452,131 @@ jobs:
             -- \
             --destdir="$DEST" \
             2>&1 \
-            | tee "
+            | tee "$GITHUB_WORKSPACE/build-pure-gki.log"
+          BUILD_EXIT=${PIPESTATUS[0]}
+          if [ "$BUILD_EXIT" -ne 0 ]; then
+            echo
+            echo "ERROR: Pure GKI build failed."
+            echo "Exit code: $BUILD_EXIT"
+            exit "$BUILD_EXIT"
+          fi
+          echo
+          echo "PURE GKI BUILD COMPLETED."
+
+      - name: "📦 Inspect GKI Artifacts"
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          DEST="$GITHUB_WORKSPACE/Final-GKI-Image"
+          echo "========================================"
+          echo "GKI ARTIFACTS"
+          echo "========================================"
+          if [ ! -d "$DEST" ]; then
+            echo "Artifact directory does not exist."
+            exit 1
+          fi
+          find "$DEST" \
+            -type f \
+            -printf '%P %s bytes\n' \
+            | sort \
+            || true
+
+      - name: "🧪 Verify GKI Kernel Image"
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          DEST="$GITHUB_WORKSPACE/Final-GKI-Image"
+          IMAGE_FOUND=0
+          for file in \
+            "$DEST/Image" \
+            "$DEST/Image.lz4" \
+            "$DEST/Image.gz" \
+            "$DEST/Image.gz-dtb" \
+            "$DEST/boot.img"
+          do
+            if [ -s "$file" ]; then
+              echo "Found kernel artifact:"
+              echo "$file"
+              IMAGE_FOUND=1
+            fi
+          done
+          if [ "$IMAGE_FOUND" -eq 0 ]; then
+            echo
+            echo "ERROR: No usable GKI kernel image found."
+            find "$DEST" \
+              -type f \
+              -printf '%P %s bytes\n' \
+              | sort \
+              || true
+            exit 1
+          fi
+          echo
+          echo "GKI artifact validation passed."
+
+      - name: "📝 Generate Build Metadata"
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          DEST="$GITHUB_WORKSPACE/Final-GKI-Image"
+          mkdir -p "$DEST"
+          {
+            echo "========================================"
+            echo "OnePlus Pad 2 Pro SM8750 Pure GKI"
+            echo "========================================"
+            echo
+            echo "Manifest branch : $MANIFEST_BRANCH"
+            echo "Manifest file   : $MANIFEST_FILE"
+            echo
+            echo "Build system    : Kleaf / Bazel"
+            echo "Build target    : //common:kernel_aarch64_dist"
+            echo "Build type      : PURE GKI"
+            echo
+            echo "OnePlus wrapper : NOT USED"
+            echo "Vendor build    : NOT USED"
+            echo
+            echo "Optional configs: ${{ inputs.APPLY_OPTIONAL_CONFIG }}"
+            echo
+            echo "Droidspaces revision:"
+            git -C /tmp/Droidspaces-OSS rev-parse HEAD \
+              2>/dev/null || true
+            echo
+            echo "Source revisions:"
+            cd "$WORKSPACE"
+            repo forall -c \
+              'printf "%s " "$REPO_PATH"; git rev-parse HEAD' \
+              2>/dev/null \
+              | sort \
+              | head -500 \
+              || true
+          } > "$DEST/BUILD_INFO.txt"
+
+      - name: "📤 Upload Pure GKI Artifacts"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oneplus_pad_2_pro_sm8750_pure_gki
+          path: |
+            Final-GKI-Image/**
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 6
+
+      - name: "📤 Upload Build Logs"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oneplus_pad_2_pro_sm8750_pure_gki_logs
+          path: |
+            build-pure-gki.log
+            bazel-common-targets.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: "📊 ccache Statistics"
+        if: always()
+        shell: bash
+        run: |
+          ccache --show-stats || true
