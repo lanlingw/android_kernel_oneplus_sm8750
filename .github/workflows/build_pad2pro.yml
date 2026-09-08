@@ -1,4 +1,5 @@
 name: Build SM8750 Pure GKI Kernel
+
 on:
   workflow_dispatch:
     inputs:
@@ -12,6 +13,7 @@ on:
         required: false
         type: boolean
         default: true
+
 jobs:
   build:
     name: OnePlus Pad 2 Pro SM8750 Pure GKI
@@ -23,6 +25,7 @@ jobs:
       MANIFEST_FILE: oneplus_pad_2_pro_b.xml
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 8G
+
     steps:
       - name: "🚀 Maximize Build Space"
         uses: easimon/maximize-build-space@master
@@ -139,20 +142,14 @@ jobs:
           echo "COMMON = $COMMON"
           echo
           echo "=== Kernel version ==="
-          grep -E \
-            '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)' \
-            "$COMMON/Makefile" \
-            || true
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)' "$COMMON/Makefile" || true
 
       - name: "📥 Fetch Droidspaces-OSS"
         shell: bash
         run: |
           set -euxo pipefail
           rm -rf /tmp/Droidspaces-OSS
-          git clone \
-            --depth=1 \
-            https://github.com/ravindu644/Droidspaces-OSS.git \
-            /tmp/Droidspaces-OSS
+          git clone --depth=1 https://github.com/ravindu644/Droidspaces-OSS.git /tmp/Droidspaces-OSS
           echo "Droidspaces revision:"
           git -C /tmp/Droidspaces-OSS rev-parse HEAD
 
@@ -164,13 +161,7 @@ jobs:
           test -d "$PATCH_DIR"
           echo "Available patches:"
           find "$PATCH_DIR" -maxdepth 1 -type f -print | sort
-          PATCH_FILE="$(
-            find "$PATCH_DIR" \
-              -maxdepth 1 \
-              -type f \
-              -iname '*sysvipc*kabi*6_7_8*.patch' \
-              | head -n 1
-          )"
+          PATCH_FILE="$(find "$PATCH_DIR" -maxdepth 1 -type f -iname '*sysvipc*kabi*6_7_8*.patch' | head -n 1)"
           if [ -z "$PATCH_FILE" ]; then
             echo "ERROR: SYSVIPC kABI patch not found."
             exit 1
@@ -189,7 +180,7 @@ jobs:
           echo "=== Patch result ==="
           git diff --stat || true
 
-      - name: "⚙️ Configure Droidspaces GKI Defconfig (strict Droidspaces rules)"
+      - name: "⚙️ Configure Droidspaces GKI Defconfig (strict)"
         shell: bash
         run: |
           set -euxo pipefail
@@ -197,7 +188,6 @@ jobs:
           CONFIG="$COMMON/arch/arm64/configs/gki_defconfig"
           test -f "$CONFIG"
 
-          # 严格只启用文档推荐的配置
           REQUIRED_CONFIGS=(
             "CONFIG_SYSVIPC=y"
             "CONFIG_POSIX_MQUEUE=y"
@@ -224,27 +214,23 @@ jobs:
             local cfg="$1"
             local key="${cfg%%=*}"
 
-            # 已经是 =y → 跳过
             if grep -qE "^${key}=y$" "$CONFIG"; then
               echo "Already enabled: $key"
               return 0
             fi
 
-            # # is not set → 改成 =y
             if grep -qE "^# ${key} is not set$" "$CONFIG"; then
               sed -i "s|^# ${key} is not set$|${cfg}|" "$CONFIG"
               echo "Changed '# is not set' → $cfg"
               return 0
             fi
 
-            # 已有其他值 → 强制改成 =y
             if grep -qE "^${key}=.*$" "$CONFIG"; then
               sed -i "s|^${key}=.*$|${cfg}|" "$CONFIG"
-              echo "Updated existing value → $cfg"
+              echo "Updated existing → $cfg"
               return 0
             fi
 
-            # 真正不存在才追加到末尾
             echo "$cfg" >> "$CONFIG"
             echo "Appended (not found): $cfg"
           }
@@ -270,64 +256,33 @@ jobs:
           grep -E '^CONFIG_(SYSVIPC|POSIX_MQUEUE|IPC_NS|PID_NS|DEVTMPFS|NETFILTER_XT_MATCH_ADDRTYPE|USER_NS)=' "$CONFIG" || true
 
           echo
-          echo "=== Diff before Bazel update ==="
+          echo "=== Diff ==="
           git -C "$COMMON" diff -- arch/arm64/configs/gki_defconfig || true
 
-      - name: "🔄 Attempt Bazel savedefconfig + Force disable check if needed"
+      - name: "🔄 Update defconfig + Disable check_defconfig"
         shell: bash
         run: |
           set -euxo pipefail
           ROOT="$WORKSPACE/kernel_platform"
           cd "$ROOT"
 
-          # 第一次尝试：用 --config=local 让 Bazel 写回源文件
-          echo "=== Attempting Bazel savedefconfig ==="
-          if tools/bazel run --config=local //common:kernel_aarch64_config -- savedefconfig; then
-            echo "Bazel savedefconfig succeeded."
-          else
-            echo "Bazel savedefconfig failed (expected in some environments)."
-          fi
+          echo "=== Attempt Bazel savedefconfig ==="
+          tools/bazel run --config=local //common:kernel_aarch64_config -- savedefconfig || true
 
           echo
-          echo "=== Diff after attempt ==="
+          echo "=== Diff after savedefconfig attempt ==="
           git -C common diff --stat -- arch/arm64/configs/gki_defconfig || true
 
-          # 关键保险：直接修改 BUILD.bazel，禁用 minimized 检查
-          # 这是 Kleaf 官方支持的属性，用于自定义 GKI 场景
           echo
-          echo "=== Disabling check_defconfig minimized in BUILD.bazel ==="
+          echo "=== Disable check_defconfig in BUILD.bazel ==="
           BUILD_FILE="common/BUILD.bazel"
-
-          # 备份
           cp "$BUILD_FILE" "$BUILD_FILE.bak"
 
-          # 查找 kernel_aarch64 定义并注入 check_defconfig = "disabled"
-          # 兼容不同写法
-          if grep -q 'name = "kernel_aarch64"' "$BUILD_FILE"; then
-            # 在 name = "kernel_aarch64" 附近插入
-            python3 - <<'EOF'
-import re, sys
-with open("common/BUILD.bazel") as f:
-    content = f.read()
+          # 简单可靠的方式：在 kernel_aarch64 定义附近注入
+          sed -i '/name = "kernel_aarch64"/a\    check_defconfig = "disabled",' "$BUILD_FILE" || true
 
-# 在 kernel_aarch64 的 kernel_build 或 common_kernel 调用中注入
-pattern = r'(name\s*=\s*"kernel_aarch64"[^)]*?)(\))'
-replacement = r'\1,\n    check_defconfig = "disabled",\n\2'
-new_content, count = re.subn(pattern, replacement, content, count=1, flags=re.DOTALL)
-if count == 0:
-    # 备用：直接在文件末尾或合适位置添加注释说明
-    print("Could not auto-inject, will use alternative method")
-    sys.exit(0)
-with open("common/BUILD.bazel", "w") as f:
-    f.write(new_content)
-print("Successfully injected check_defconfig = \"disabled\"")
-EOF
-          fi
-
-          # 再次确认
-          echo
-          echo "=== Relevant part of BUILD.bazel ==="
-          grep -A 20 -E 'name = "kernel_aarch64"' common/BUILD.bazel || true
+          echo "=== Relevant BUILD.bazel content ==="
+          grep -A 15 -E 'name = "kernel_aarch64"' "$BUILD_FILE" || true
 
       - name: "🔐 Verify GKI KMI Settings"
         shell: bash
@@ -367,14 +322,13 @@ EOF
           mkdir -p "$DEST"
           cd "$ROOT"
           echo "========================================"
-          echo "PURE GKI BUILD (check_defconfig disabled)"
+          echo "PURE GKI BUILD"
           echo "========================================"
           tools/bazel run \
             //common:kernel_aarch64_dist \
             -- \
             --destdir="$DEST" \
-            2>&1 \
-            | tee "$GITHUB_WORKSPACE/build-pure-gki.log"
+            2>&1 | tee "$GITHUB_WORKSPACE/build-pure-gki.log"
           BUILD_EXIT=${PIPESTATUS[0]}
           if [ "$BUILD_EXIT" -ne 0 ]; then
             echo "ERROR: Pure GKI build failed. Exit code: $BUILD_EXIT"
@@ -404,9 +358,15 @@ EOF
           set -u
           DEST="$GITHUB_WORKSPACE/Final-GKI-Image"
           IMAGE_FOUND=0
-          for file in "$DEST/Image" "$DEST/Image.lz4" "$DEST/Image.gz" "$DEST/Image.gz-dtb" "$DEST/boot.img"; do
+          for file in \
+            "$DEST/Image" \
+            "$DEST/Image.lz4" \
+            "$DEST/Image.gz" \
+            "$DEST/Image.gz-dtb" \
+            "$DEST/boot.img"
+          do
             if [ -s "$file" ]; then
-              echo "Found kernel artifact: $file"
+              echo "Found: $file"
               IMAGE_FOUND=1
             fi
           done
@@ -433,7 +393,7 @@ EOF
             echo "Build system    : Kleaf / Bazel"
             echo "Build target    : //common:kernel_aarch64_dist"
             echo "Build type      : PURE GKI"
-            echo "check_defconfig : disabled (custom Droidspaces)"
+            echo "check_defconfig : disabled"
             echo "Optional configs: ${{ inputs.APPLY_OPTIONAL_CONFIG }}"
             echo
             echo "Droidspaces revision:"
