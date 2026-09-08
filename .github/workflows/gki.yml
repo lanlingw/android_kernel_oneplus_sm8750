@@ -1,15 +1,28 @@
-name: Build GKI boot.img Only
+name: Build Kernel
 
 on:
   workflow_dispatch:
+    inputs:
+      TARGET:
+        description: "Kleaf target（官方 README：sun）"
+        required: false
+        type: string
+        default: "sun"
+      VARIANT:
+        description: "Kleaf variant（官方 README：perf）"
+        required: false
+        type: string
+        default: "perf"
 
 jobs:
   build:
-    name: Build GKI boot.img Only
+    name: Build ${{ inputs.TARGET || 'sun' }} ${{ inputs.VARIANT || 'perf' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 480
 
     env:
+      TARGET: ${{ inputs.TARGET || 'sun' }}
+      VARIANT: ${{ inputs.VARIANT || 'perf' }}
       WORKSPACE: kernel_workspace
 
     steps:
@@ -56,48 +69,56 @@ jobs:
 
           repo sync -c -j"$(nproc --all)" --no-tags --no-clone-bundle --force-sync
 
-      - name: "🔨 Build GKI boot.img Only (Skip Vendor Modules)"
+          echo "workspace root:"
+          ls -la
+          echo "kernel_platform:"
+          ls -la kernel_platform/
+
+      - name: "🔨 Build Kernel with Vendor Modules"
         run: |
           set -euo pipefail
-          cd "$WORKSPACE/kernel_platform"
+          cd "$WORKSPACE"
 
           # 禁用 KMI 符号裁剪与 ABI 严格校验
           export EXTRA_KBUILD_ARGS="--skip_abi --kmi_symbol_list_strict_mode=false"
           export TRIM_NONLISTED_KMI=0
 
-          # 使用 Kleaf 原生 Bazel 直接编译并复制 GKI 产物到 out 目录
-          tools/bazel run //common:kernel_aarch64_dist -- \
-            --dist_dir="$PWD/out/gki/dist" \
-            2>&1 | tee "$GITHUB_WORKSPACE/build-boot-img.log"
+          ./kernel_platform/oplus/build/oplus_build_kernel.sh "${TARGET}" "${VARIANT}" 2>&1 | tee "$GITHUB_WORKSPACE/build-kernel-${TARGET}-${VARIANT}.log"
 
-      - name: "📦 Collect boot.img Artifacts"
+      - name: "📦 Collect dist artifacts"
         if: always()
         run: |
           set -euo pipefail
-          DIST="$WORKSPACE/kernel_platform/out/gki/dist"
+          DIST="$WORKSPACE/kernel_platform/out/msm-kernel-${TARGET}-${VARIANT}/dist"
           DEST="$GITHUB_WORKSPACE/Final-Image"
-          mkdir -p "$DEST"
+          mkdir -p "$DEST/modules" "$DEST/dtb"
 
           if [ ! -d "$DIST" ]; then
             echo "dist directory missing, nothing to collect"
             exit 0
           fi
 
-          for f in boot.img init_boot.img Image Image.gz Image.lz4 vmlinux System.map .config; do
+          for f in boot.img init_boot.img vendor_boot.img vendor_dlkm.img dtbo.img Image Image.gz Image.lz4 \
+                   vmlinux System.map .config; do
             if [ -f "$DIST/$f" ]; then
               cp "$DIST/$f" "$DEST/$(basename "$f")"
-              echo "Copied: $f"
             fi
           done
+
+          cp "$DIST"/*.dtb "$DEST/dtb/" 2>/dev/null || true
+          cp "$DIST"/*.dtbo "$DEST/dtb/" 2>/dev/null || true
+          cp "$DIST"/*.ko "$DEST/modules/" 2>/dev/null || true
+          cp "$DIST"/modules.load "$DEST/" 2>/dev/null || true
+          cp "$DIST"/vendor_dlkm.modules.load "$DEST/" 2>/dev/null || true
 
           echo "Artifact layout:"
           find "$DEST" -maxdepth 2 -type f | sort | sed 's#^# - #' || true
 
-      - name: "📤 Upload Boot Images & Kernel"
+      - name: "📤 Upload Kernel Artifacts"
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: OnePlus_Pad_2_Pro_GKI_boot_img
+          name: kernel_pad2pro_${{ env.TARGET }}_${{ env.VARIANT }}
           path: |
             Final-Image
           retention-days: 7
@@ -106,7 +127,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build_log_boot_img
+          name: build_log_pad2pro_${{ env.TARGET }}_${{ env.VARIANT }}
           path: |
-            build-boot-img.log
+            build-kernel-${{ env.TARGET }}-${{ env.VARIANT }}.log
           retention-days: 3
