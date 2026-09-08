@@ -234,35 +234,65 @@ jobs:
           echo
           echo "=== Diff ==="
           git -C "$COMMON" diff -- arch/arm64/configs/gki_defconfig || true
-      - name: "🔄 Update defconfig + Disable check_defconfig"
+      - name: "🔄 Canonicalize GKI defconfig (Kleaf savedefconfig compatible)"
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ROOT="$WORKSPACE/kernel_platform"
+          COMMON="$ROOT/common"
+          CONFIG="$COMMON/arch/arm64/configs/gki_defconfig"
+          TMP_OUT="$ROOT/out/droidspaces-defconfig"
+
+          test -f "$CONFIG"
+          rm -rf "$TMP_OUT"
+          mkdir -p "$TMP_OUT"
+
+          echo "=== Generate canonical GKI .config ==="
+          make -C "$COMMON" \
+            O="$TMP_OUT" \
+            ARCH=arm64 \
+            gki_defconfig
+
+          echo "=== Generate canonical savedefconfig ==="
+          make -C "$COMMON" \
+            O="$TMP_OUT" \
+            ARCH=arm64 \
+            savedefconfig
+
+          test -s "$TMP_OUT/defconfig"
+          cp "$TMP_OUT/defconfig" "$CONFIG"
+
+          echo "=== Canonical gki_defconfig checks ==="
+          grep -E '^CONFIG_(SYSVIPC|POSIX_MQUEUE|IPC_NS|PID_NS|DEVTMPFS|NETFILTER_XT_MATCH_ADDRTYPE)=' "$CONFIG" || true
+          echo
+          echo "=== Diff after canonicalization ==="
+          git -C "$COMMON" diff -- arch/arm64/configs/gki_defconfig || true
+
+          echo "=== Verify effective .config has all mandatory Droidspaces options ==="
+          for key in \
+            CONFIG_SYSVIPC \
+            CONFIG_POSIX_MQUEUE \
+            CONFIG_IPC_NS \
+            CONFIG_PID_NS \
+            CONFIG_DEVTMPFS \
+            CONFIG_NETFILTER_XT_MATCH_ADDRTYPE; do
+            if ! grep -qE "^${key}=y$" "$TMP_OUT/.config"; then
+              echo "ERROR: effective .config does not contain ${key}=y"
+              exit 1
+            fi
+          done
+          echo "All mandatory Droidspaces options are enabled in effective .config."
+
+      - name: "🔐 Verify GKI KMI Settings"
         shell: bash
         run: |
           set -euxo pipefail
           ROOT="$WORKSPACE/kernel_platform"
           cd "$ROOT"
-          echo "=== Attempt Bazel savedefconfig ==="
-          tools/bazel run --config=local //common:kernel_aarch64_config -- savedefconfig || true
-          echo
-          echo "=== Diff after savedefconfig attempt ==="
-          git -C common diff --stat -- arch/arm64/configs/gki_defconfig || true
-          echo
-          echo "=== Disable check_defconfig in BUILD.bazel ==="
-          BUILD_FILE="common/BUILD.bazel"
-          cp "$BUILD_FILE" "$BUILD_FILE.bak"
-          # 简单可靠的方式：在 kernel_aarch64 定义附近注入
-          sed -i '/name = "kernel_aarch64"/a\    check_defconfig = "disabled",' "$BUILD_FILE" || true
-          echo "=== Relevant BUILD.bazel content ==="
-          grep -A 15 -E 'name = "kernel_aarch64"' "$BUILD_FILE" || true
-      - name: "🔐 Verify / Force-Disable GKI KMI Settings"
-        shell: bash
-        run: |
-          set -euxo pipefail
-          ROOT="$WORKSPACE/kernel_platform"
-          cd "$ROOT"
-          echo "=== KMI related settings (before force-disable) ==="
+          echo "=== KMI related settings ==="
           grep -R -n -E 'KMI_SYMBOL_LIST_STRICT_MODE|TRIM_NONLISTED_KMI|kmi_symbol_list_strict_mode|trim_nonlisted_kmi' . --exclude-dir=.git 2>/dev/null | head -100 || true
           echo
-          echo "KMI trimming will be disabled at build time via --notrim + --nokmi_symbol_list_strict_mode"
+          echo "KMI trimming remains disabled at build time via --notrim + --nokmi_symbol_list_strict_mode"
       - name: "🔎 Inspect Kleaf GKI Targets"
         shell: bash
         run: |
@@ -362,10 +392,10 @@ jobs:
             echo "Build system    : Kleaf / Bazel"
             echo "Build target    : //common:kernel_aarch64_dist"
             echo "Build type      : PURE GKI"
-            echo "check_defconfig : disabled"
+            echo "check_defconfig : preserved; gki_defconfig canonicalized with savedefconfig"
             echo "Optional configs: ${{ inputs.APPLY_OPTIONAL_CONFIG }}"
             echo
-            echo "KMI optimization: DISABLED"
+            echo "KMI trimming    : DISABLED (workflow-specific)"
             echo "  - --notrim (TRIM_NONLISTED_KMI off)"
             echo "  - --nokmi_symbol_list_strict_mode"
             echo
