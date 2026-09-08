@@ -68,7 +68,7 @@ jobs:
           echo "⬇️ Fetching Droidspaces-OSS kABI patches..."
           git clone --depth=1 https://github.com/ravindu644/Droidspaces-OSS.git /tmp/Droidspaces-OSS
           
-          PATCH_FILE="/tmp/Droidspaces-OSS/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kABI_6_7_8.patch"
+          PATCH_FILE="/tmp/Droidspaces-OSS/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch"
           COMMON_DIR="$WORKSPACE/kernel_platform/common"
           
           if [ -f "$PATCH_FILE" ]; then
