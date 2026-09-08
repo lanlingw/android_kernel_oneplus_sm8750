@@ -18,7 +18,7 @@ on:
           - debug
         default: "gki"
       APPLY_OPTIONAL_CONFIG:
-        description: "Enable optional Droidspaces GKI configs"
+        description: "Enable optional/recommended Droidspaces GKI configs"
         required: false
         type: boolean
         default: false
@@ -169,7 +169,6 @@ jobs:
         run: |
           set -euxo pipefail
 
-          # Force absolute path
           WORKSPACE="$(realpath -m "$WORKSPACE")"
           echo "WORKSPACE (absolute): $WORKSPACE"
 
@@ -221,7 +220,6 @@ jobs:
           echo "========================================"
           ls -lah "$WORKSPACE/kernel_platform"
 
-          # Early check for critical files
           echo
           echo "========================================"
           echo "Early path verification"
@@ -366,53 +364,114 @@ jobs:
             | sort
 
       # ============================================================
-      # 10. Locate SYSVIPC kABI patch
+      # 10. Verify kernel version and locate the correct Droidspaces patch
       # ============================================================
-      - name: "🩹 Locate Droidspaces SYSVIPC kABI Patch"
+      - name: "🩹 Locate Droidspaces GKI kABI Patch"
         shell: bash
         run: |
           set -euxo pipefail
 
-          PATCH_DIR="/tmp/Droidspaces-OSS/Documentation/resources/kernel-patches/GKI/below-kernel-6.12"
+          WORKSPACE="$(realpath -m "$WORKSPACE")"
+          ROOT="$WORKSPACE/kernel_platform"
+          COMMON_DIR="$ROOT/common"
 
-          if [ ! -d "$PATCH_DIR" ]; then
-            echo "❌ Patch directory does not exist:"
-            echo "$PATCH_DIR"
-            exit 1
-          fi
+          PATCH_ROOT="/tmp/Droidspaces-OSS/Documentation/resources/kernel-patches/GKI"
+          PATCH_DIR_BELOW="$PATCH_ROOT/below-kernel-6.12"
+          PATCH_DIR_612="$PATCH_ROOT/kernel-6.12"
 
-          echo "Available patches:"
-          find "$PATCH_DIR" \
-            -maxdepth 1 \
-            -type f \
-            -print \
-            | sort
+          echo "========================================"
+          echo "Kernel version detection"
+          echo "========================================"
 
-          PATCH_FILE="$(
-            find "$PATCH_DIR" \
-              -maxdepth 1 \
-              -type f \
-              -iname '*sysvipc*kabi*6_7_8*.patch' \
-              -print \
-              | head -n 1
+          KERNEL_VERSION="$(
+            awk -F= '/^VERSION =/ {print $2} /^PATCHLEVEL =/ {print $2} /^SUBLEVEL =/ {print $2}' "$COMMON_DIR/Makefile" \
+              | tr '\n' ' ' \
+              | awk '{gsub(/^[[:space:]]+|[[:space:]]+$/, ""); printf "%s.%s.%s", $1, $2, $3}'
           )"
 
+          echo "Detected kernel version: $KERNEL_VERSION"
+          test -n "$KERNEL_VERSION"
+
+          KERNEL_MAJOR="$(echo "$KERNEL_VERSION" | cut -d. -f1)"
+          KERNEL_MINOR="$(echo "$KERNEL_VERSION" | cut -d. -f2)"
+
+          echo "Kernel major: $KERNEL_MAJOR"
+          echo "Kernel minor: $KERNEL_MINOR"
+
+          if [ "$KERNEL_MAJOR" -gt 6 ] || { [ "$KERNEL_MAJOR" -eq 6 ] && [ "$KERNEL_MINOR" -ge 12 ]; }; then
+            echo "Kernel family: 6.12+"
+            PATCH_FILE="$(
+              find "$PATCH_DIR_612" \
+                -maxdepth 1 \
+                -type f \
+                -iname '*sysvipc*kabi*.patch' \
+                -print \
+                | sort \
+                | head -n 1
+            )"
+          else
+            echo "Kernel family: below 6.12"
+            PATCH_FILE="$(
+              find "$PATCH_DIR_BELOW" \
+                -maxdepth 1 \
+                -type f \
+                -iname '*sysvipc*kabi*6_7_8*.patch' \
+                -print \
+                | sort \
+                | head -n 1
+            )"
+
+            if [ -z "$PATCH_FILE" ]; then
+              PATCH_FILE="$(
+                find "$PATCH_DIR_BELOW" \
+                  -maxdepth 1 \
+                  -type f \
+                  -iname '*sysvipc*kabi*.patch' \
+                  -print \
+                  | sort \
+                  | head -n 1
+              )"
+            fi
+          fi
+
           if [ -z "$PATCH_FILE" ]; then
-            echo
-            echo "❌ SYSVIPC kABI patch not found."
+            echo "❌ No suitable Droidspaces SYSVIPC kABI patch found."
             exit 1
           fi
 
           echo
-          echo "Selected patch:"
+          echo "Selected SYSVIPC kABI patch:"
           echo "$PATCH_FILE"
-
           echo "PATCH_FILE=$PATCH_FILE" >> "$GITHUB_ENV"
+          echo "KERNEL_VERSION=$KERNEL_VERSION" >> "$GITHUB_ENV"
+
+          # POSIX_MQUEUE extra kABI patch is required ONLY for <= 5.10.
+          if [ "$KERNEL_MAJOR" -lt 5 ] || { [ "$KERNEL_MAJOR" -eq 5 ] && [ "$KERNEL_MINOR" -le 10 ]; }; then
+            POSIX_PATCH_FILE="$(
+              find "$PATCH_DIR_BELOW" \
+                -maxdepth 1 \
+                -type f \
+                -iname '*5.10*posix*mqueue*.patch' \
+                -print \
+                | sort \
+                | head -n 1
+            )"
+
+            if [ -z "$POSIX_PATCH_FILE" ]; then
+              echo "❌ Kernel <= 5.10 requires the Droidspaces POSIX_MQUEUE kABI patch, but it was not found."
+              exit 1
+            fi
+
+            echo "POSIX_PATCH_FILE=$POSIX_PATCH_FILE" >> "$GITHUB_ENV"
+            echo "POSIX_MQUEUE kABI patch: $POSIX_PATCH_FILE"
+          else
+            echo "POSIX_MQUEUE extra kABI patch: not required for this kernel version."
+          fi
 
       # ============================================================
-      # 11. Apply Droidspaces kABI patch
+      # 11. Apply Droidspaces kABI patches
       # ============================================================
-      - name: "🩹 Apply Droidspaces SYSVIPC kABI Patch"
+      - name: "🩹 Apply Droidspaces kABI Patches"
         shell: bash
         run: |
           set -euxo pipefail
@@ -425,13 +484,20 @@ jobs:
 
           cd "$COMMON_DIR"
 
-          echo "Applying:"
+          echo "========================================"
+          echo "Applying SYSVIPC kABI patch"
+          echo "========================================"
           echo "$PATCH_FILE"
+          patch --forward -p1 < "$PATCH_FILE"
 
-          patch \
-            --forward \
-            -p1 \
-            < "$PATCH_FILE"
+          if [ -n "${POSIX_PATCH_FILE:-}" ]; then
+            echo
+            echo "========================================"
+            echo "Applying POSIX_MQUEUE kABI patch"
+            echo "========================================"
+            echo "$POSIX_PATCH_FILE"
+            patch --forward -p1 < "$POSIX_PATCH_FILE"
+          fi
 
           echo
           echo "========================================"
@@ -440,45 +506,46 @@ jobs:
           git diff --check || true
           git diff --stat || true
 
-          echo
-          echo "✅ Droidspaces SYSVIPC kABI patch applied"
+          echo "✅ Droidspaces kABI patch stage completed"
 
       # ============================================================
-      # 12. Configure GKI defconfig  (FIXED)
+      # 12. Configure Droidspaces GKI defconfig
+      #     Important: modify individual symbols, then canonicalize
+      #     the defconfig using Kconfig/savedefconfig BEFORE Bazel.
       # ============================================================
-      - name: "⚙️ Configure Droidspaces GKI Defconfig"
+      - name: "⚙️ Configure and Canonicalize Droidspaces GKI Defconfig"
         shell: bash
         run: |
           set -euxo pipefail
 
-          # Force absolute path to avoid relative path + cd traps
           WORKSPACE="$(realpath -m "$WORKSPACE")"
-          COMMON_DIR="$WORKSPACE/kernel_platform/common"
+          ROOT="$WORKSPACE/kernel_platform"
+          COMMON_DIR="$ROOT/common"
           CONFIG_FILE="$COMMON_DIR/arch/arm64/configs/gki_defconfig"
+          CONFIG_OUT="$ROOT/out/droidspaces-defconfig"
 
           echo "WORKSPACE   : $WORKSPACE"
           echo "COMMON_DIR  : $COMMON_DIR"
           echo "CONFIG_FILE : $CONFIG_FILE"
-          echo
+          echo "CONFIG_OUT  : $CONFIG_OUT"
 
-          # Critical checks MUST happen before any cd
           if [ ! -d "$COMMON_DIR" ]; then
             echo "❌ COMMON_DIR does not exist: $COMMON_DIR"
-            echo "Current directory: $(pwd)"
-            ls -la "$WORKSPACE" || true
             exit 1
           fi
 
           if [ ! -f "$CONFIG_FILE" ]; then
             echo "❌ gki_defconfig not found: $CONFIG_FILE"
-            echo "Listing configs directory:"
-            ls -la "$COMMON_DIR/arch/arm64/configs/" || true
             exit 1
           fi
 
-          echo "✅ Paths verified, entering COMMON_DIR"
           cd "$COMMON_DIR"
 
+          # ----------------------------------------------------------------
+          # Droidspaces GKI configuration.
+          # These are exactly the GKI options from the Droidspaces guide.
+          # Do not add unrelated GKI options.
+          # ----------------------------------------------------------------
           REQUIRED_CONFIGS=(
             "CONFIG_SYSVIPC=y"
             "CONFIG_POSIX_MQUEUE=y"
@@ -489,6 +556,7 @@ jobs:
           )
 
           OPTIONAL_CONFIGS=(
+            "CONFIG_USER_NS=y"
             "CONFIG_NETFILTER_XT_TARGET_REJECT=y"
             "CONFIG_NETFILTER_XT_TARGET_LOG=y"
             "CONFIG_NETFILTER_XT_MATCH_RECENT=y"
@@ -503,18 +571,22 @@ jobs:
           set_config() {
             local cfg="$1"
             local key="${cfg%%=*}"
+
             if grep -qE "^${key}=.*$" "$CONFIG_FILE"; then
               sed -i "s|^${key}=.*$|${cfg}|" "$CONFIG_FILE"
             elif grep -qE "^# ${key} is not set$" "$CONFIG_FILE"; then
               sed -i "s|^# ${key} is not set$|${cfg}|" "$CONFIG_FILE"
             else
+              # Droidspaces explicitly allows a missing individual option
+              # to be added at the end. We canonicalize with savedefconfig
+              # immediately afterwards, which resolves Kconfig ordering.
               echo "$cfg" >> "$CONFIG_FILE"
             fi
           }
 
           echo
           echo "========================================"
-          echo "Required Droidspaces configs"
+          echo "Required Droidspaces GKI configs"
           echo "========================================"
           for cfg in "${REQUIRED_CONFIGS[@]}"; do
             echo "Enabling: $cfg"
@@ -524,7 +596,7 @@ jobs:
           if [ "${{ inputs.APPLY_OPTIONAL_CONFIG }}" = "true" ]; then
             echo
             echo "========================================"
-            echo "Optional Droidspaces configs"
+            echo "Optional/recommended Droidspaces GKI configs"
             echo "========================================"
             for cfg in "${OPTIONAL_CONFIGS[@]}"; do
               echo "Enabling: $cfg"
@@ -532,23 +604,149 @@ jobs:
             done
           else
             echo
-            echo "Optional Droidspaces configs: DISABLED"
+            echo "Optional/recommended Droidspaces GKI configs: DISABLED"
           fi
 
           echo
           echo "========================================"
-          echo "Final GKI configuration"
+          echo "Pre-canonicalization config"
           echo "========================================"
           grep -E \
-            '^CONFIG_(SYSVIPC|POSIX_MQUEUE|IPC_NS|PID_NS|DEVTMPFS|NETFILTER_XT_MATCH_ADDRTYPE)=' \
+            '^CONFIG_(SYSVIPC|POSIX_MQUEUE|IPC_NS|PID_NS|DEVTMPFS|NETFILTER_XT_MATCH_ADDRTYPE|USER_NS|NETFILTER_XT_TARGET_REJECT|NETFILTER_XT_TARGET_LOG|NETFILTER_XT_MATCH_RECENT|IP_SET|IP_SET_HASH_IP|IP_SET_HASH_NET|NETFILTER_XT_SET|TMPFS_POSIX_ACL|TMPFS_XATTR)=' \
             "$CONFIG_FILE" \
             || true
+
+          # ----------------------------------------------------------------
+          # IMPORTANT FIX FOR THIS ONEPLUS/KLEAF TREE:
+          #
+          # OnePlus's GKI build checks:
+          #   make savedefconfig
+          #   diff generated_defconfig gki_defconfig
+          #
+          # Therefore the Droidspaces-edited source file must first be
+          # canonicalized by the same Kconfig machinery. This also explains
+          # the previous failure where PID_NS/IPC_NS disappeared and other
+          # symbols moved positions in the generated defconfig.
+          # ----------------------------------------------------------------
+          rm -rf "$CONFIG_OUT"
+          mkdir -p "$CONFIG_OUT"
+
+          echo
+          echo "========================================"
+          echo "Generate Kconfig .config from gki_defconfig"
+          echo "========================================"
+          make \
+            -C "$COMMON_DIR" \
+            O="$CONFIG_OUT" \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            gki_defconfig
+
+          echo
+          echo "========================================"
+          echo "Generate canonical savedefconfig"
+          echo "========================================"
+          make \
+            -C "$COMMON_DIR" \
+            O="$CONFIG_OUT" \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            savedefconfig
+
+          test -s "$CONFIG_OUT/defconfig"
+
+          echo
+          echo "========================================"
+          echo "Replace source gki_defconfig with canonical version"
+          echo "========================================"
+          cp -f "$CONFIG_OUT/defconfig" "$CONFIG_FILE"
+
+          echo
+          echo "========================================"
+          echo "Canonical gki_defconfig"
+          echo "========================================"
+          grep -E \
+            '^CONFIG_(SYSVIPC|POSIX_MQUEUE|IPC_NS|PID_NS|DEVTMPFS|NETFILTER_XT_MATCH_ADDRTYPE|USER_NS|NETFILTER_XT_TARGET_REJECT|NETFILTER_XT_TARGET_LOG|NETFILTER_XT_MATCH_RECENT|IP_SET|IP_SET_HASH_IP|IP_SET_HASH_NET|NETFILTER_XT_SET|TMPFS_POSIX_ACL|TMPFS_XATTR)=' \
+            "$CONFIG_FILE" \
+            || true
+
+          echo
+          echo "========================================"
+          echo "Verify final .config values"
+          echo "========================================"
+          for key in \
+            CONFIG_SYSVIPC \
+            CONFIG_POSIX_MQUEUE \
+            CONFIG_IPC_NS \
+            CONFIG_PID_NS \
+            CONFIG_DEVTMPFS \
+            CONFIG_NETFILTER_XT_MATCH_ADDRTYPE; do
+            value="$(scripts/config --file "$CONFIG_OUT/.config" --get "$key" 2>/dev/null || true)"
+            echo "$key=$value"
+            if [ "$value" != "y" ]; then
+              echo "❌ Required Droidspaces config is not enabled in final .config: $key"
+              exit 1
+            fi
+          done
+
+          if [ "${{ inputs.APPLY_OPTIONAL_CONFIG }}" = "true" ]; then
+            for key in \
+              CONFIG_USER_NS \
+              CONFIG_NETFILTER_XT_TARGET_REJECT \
+              CONFIG_NETFILTER_XT_TARGET_LOG \
+              CONFIG_NETFILTER_XT_MATCH_RECENT \
+              CONFIG_IP_SET \
+              CONFIG_IP_SET_HASH_IP \
+              CONFIG_IP_SET_HASH_NET \
+              CONFIG_NETFILTER_XT_SET \
+              CONFIG_TMPFS_POSIX_ACL \
+              CONFIG_TMPFS_XATTR; do
+              value="$(scripts/config --file "$CONFIG_OUT/.config" --get "$key" 2>/dev/null || true)"
+              echo "$key=$value"
+              if [ "$value" != "y" ]; then
+                echo "❌ Optional/recommended config requested but not enabled: $key"
+                exit 1
+              fi
+            done
+          fi
+
+          echo
+          echo "========================================"
+          echo "Canonical defconfig self-check"
+          echo "========================================"
+          rm -rf "$CONFIG_OUT/recheck"
+          mkdir -p "$CONFIG_OUT/recheck"
+
+          make \
+            -C "$COMMON_DIR" \
+            O="$CONFIG_OUT/recheck" \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            gki_defconfig
+
+          make \
+            -C "$COMMON_DIR" \
+            O="$CONFIG_OUT/recheck" \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            savedefconfig
+
+          diff -u "$CONFIG_FILE" "$CONFIG_OUT/recheck/defconfig"
+          echo "✅ gki_defconfig is canonical and matches savedefconfig"
 
           echo
           echo "========================================"
           echo "Defconfig git diff"
           echo "========================================"
           git diff -- arch/arm64/configs/gki_defconfig || true
+
+          # Preserve the config workspace for diagnostics/artifacts.
+          cp -f "$CONFIG_FILE" "$GITHUB_WORKSPACE/final-gki_defconfig"
+          cp -f "$CONFIG_OUT/.config" "$GITHUB_WORKSPACE/final-dot-config"
 
       # ============================================================
       # 13. Verify KMI settings
@@ -594,6 +792,9 @@ jobs:
             echo "OnePlus Pad 2 Pro Droidspaces Build"
             echo "========================================"
             echo
+            echo "Kernel version:"
+            echo "$KERNEL_VERSION"
+            echo
             echo "Manifest branch:"
             echo "$MANIFEST_BRANCH"
             echo
@@ -606,11 +807,19 @@ jobs:
             echo "Variant:"
             echo "$VARIANT"
             echo
-            echo "Optional configs:"
+            echo "Optional/recommended configs:"
             echo "${{ inputs.APPLY_OPTIONAL_CONFIG }}"
             echo
             echo "Clean build:"
             echo "${{ inputs.CLEAN_BUILD }}"
+            echo
+            echo "SYSVIPC kABI patch:"
+            echo "$PATCH_FILE"
+            if [ -n "${POSIX_PATCH_FILE:-}" ]; then
+              echo
+              echo "POSIX_MQUEUE kABI patch:"
+              echo "$POSIX_PATCH_FILE"
+            fi
             echo
             echo "========================================"
             echo "Droidspaces revision"
@@ -651,6 +860,7 @@ jobs:
               out/msm-kernel-* \
               out/common \
               out/dist \
+              out/droidspaces-defconfig \
               2>/dev/null || true
           else
             echo "Clean build disabled."
@@ -673,9 +883,10 @@ jobs:
           echo "========================================"
           echo "OnePlus Kernel Build"
           echo "========================================"
-          echo "TARGET : $TARGET"
-          echo "VARIANT: $VARIANT"
-          echo "JOBS   : $BUILD_JOBS"
+          echo "Kernel  : $KERNEL_VERSION"
+          echo "TARGET  : $TARGET"
+          echo "VARIANT : $VARIANT"
+          echo "JOBS    : $BUILD_JOBS"
           echo
           echo "Build wrapper:"
           echo "$ROOT/oplus/build/oplus_build_kernel.sh"
@@ -829,6 +1040,10 @@ jobs:
             )
           fi
 
+          # Also preserve the canonical defconfig and config diagnostics.
+          [ -f "$GITHUB_WORKSPACE/final-gki_defconfig" ] && cp -f "$GITHUB_WORKSPACE/final-gki_defconfig" "$DEST/" || true
+          [ -f "$GITHUB_WORKSPACE/final-dot-config" ] && cp -f "$GITHUB_WORKSPACE/final-dot-config" "$DEST/" || true
+
           echo
           echo "========================================"
           echo "Final artifact list"
@@ -913,12 +1128,11 @@ jobs:
             echo "OnePlus Pad 2 Pro Droidspaces Kernel"
             echo "========================================"
             echo
+            echo "Kernel version  : ${KERNEL_VERSION:-unknown}"
             echo "Manifest branch : $MANIFEST_BRANCH"
             echo "Manifest file   : $MANIFEST_FILE"
-            echo
             echo "Target          : $TARGET"
             echo "Variant         : $VARIANT"
-            echo
             echo "Optional config : ${{ inputs.APPLY_OPTIONAL_CONFIG }}"
             echo "Clean build     : ${{ inputs.CLEAN_BUILD }}"
             echo
@@ -927,6 +1141,12 @@ jobs:
             echo "========================================"
             git -C /tmp/Droidspaces-OSS rev-parse HEAD \
               2>/dev/null || true
+            echo
+            echo "========================================"
+            echo "Selected kABI patch"
+            echo "========================================"
+            echo "SYSVIPC: ${PATCH_FILE:-unknown}"
+            echo "POSIX_MQUEUE: ${POSIX_PATCH_FILE:-not required}"
             echo
             echo "========================================"
             echo "Kernel platform revision"
@@ -988,6 +1208,8 @@ jobs:
             build-config-files.txt
             found-artifacts.txt
             SOURCE_INFO.txt
+            final-gki_defconfig
+            final-dot-config
           if-no-files-found: warn
           retention-days: 14
 
