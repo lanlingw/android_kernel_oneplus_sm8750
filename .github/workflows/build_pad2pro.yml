@@ -1,28 +1,5 @@
 name: Build OnePlus Pad 2 Pro GKI boot.img
 
-# 官方构建方式参考:
-#   OnePlusOSS/kernel_manifest 仓库 README:
-#     ./kernel_platform/oplus/build/oplus_build_kernel.sh <platform> <variant>
-#   OnePlus Pad 2 Pro (SM8750) 的 platform = sun, GKI user 版用 variant = perf
-#   底层调用: build_with_bazel.py -t sun perf --out_dir out/msm-kernel-sun-perf
-#   产物路径: out/msm-kernel-sun-perf/dist/
-#
-# 产物清单 (来自 msm_kernel_la.bzl 的 _define_image_build):
-#   perf 变体 (define_abi_targets=True, GKI 路径):
-#     - boot.img / init_boot.img  来自 //common:kernel_aarch64 (GKI 内核, 已注入 sun dtb)
-#     - dtbo.img                  build_dtbo=True (sun 有 dtbo_list)
-#     - vendor_boot.img           build_vendor_boot=True (sun 有 dtbo_list)
-#     - vendor_dlkm.img           build_vendor_dlkm=True (默认)
-#     - system_dlkm.img           不会生成 (build_system_dlkm 默认 False; build.config 里的
-#                                 PREPARE_SYSTEM_DLKM 是给旧 build_utils.sh 用的, 不影响 bazel)
-#   consolidate 变体 (define_abi_targets=False, 非标准 GKI):
-#     - boot.img                  build_boot=True (本 target 自建, 不走 GKI common)
-#     - 其余同 perf
-# boot.img 参数 (来自 build.config.msm.sun + sun.bzl):
-#   BOOT_IMAGE_HEADER_VERSION=4, BASE_ADDRESS=0x80000000, PAGE_SIZE=4096
-#   perf 变体 cmdline: 'nosoftlockup console=ttynull qcom_geni_serial.con_enabled=0 ...'
-#   consolidate 变体 cmdline: 'console=ttynull qcom_geni_serial.con_enabled=0 earlycon ...'
-
 on:
   workflow_dispatch:
     inputs:
@@ -87,7 +64,6 @@ jobs:
 
       - name: "📥 Install Repo Tool"
         run: |
-          # repo 工具依赖 git user.name/user.email, 否则 repo init 会失败
           git config --global user.name "github-actions"
           git config --global user.email "github-actions@github.com"
           curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
@@ -101,12 +77,6 @@ jobs:
           mkdir -p kernel_workspace
           cd kernel_workspace
 
-          # 用官方 manifest 同步完整 kernel_platform 布局:
-          #   kernel_platform/common        <- android_kernel_common_oneplus_sm8750 (GKI 内核)
-          #   kernel_platform/msm-kernel    <- android_kernel_oneplus_sm8750 (设备内核, 含 build_with_bazel.py)
-          #   ./                            <- android_kernel_modules_and_devicetree_oneplus_sm8750 (oplus 构建脚本 + vendor 模块/dt)
-          #   kernel_platform/prebuilts/... <- 预编译 clang/jdk/build-tools (来自 codelinaro)
-          #   kernel_platform/tools/mkbootimg <- mkbootimg 工具
           repo init -u https://github.com/OnePlusOSS/kernel_manifest.git \
             -b "${MANIFEST_BRANCH}" \
             -m "${MANIFEST_FILE}" \
@@ -131,212 +101,10 @@ jobs:
           test -d kernel_platform/prebuilts/clang/host/linux-x86 || { echo "prebuilts/clang missing"; exit 1; }
           echo "✅ All build inputs ready"
 
-      - name: "⚙️ Apply Custom Kernel Config"
-        run: |
-          set -euo pipefail
-          cd kernel_workspace
-
-          # perf 变体下 boot.img 内核本体来自 //common:kernel_aarch64, 用 gki_defconfig
-          # 必须改 GKI common 的配置, 改 msm-kernel/sun_perf.config 只影响 vendor_dlkm
-          #
-          # 实测 gki_defconfig 里:
-          #   # CONFIG_PID_NS is not set   <- 明确禁用
-          #   CONFIG_SYSVIPC / POSIX_MQUEUE / IPC_NS <- 未出现 (需显式开启)
-          #
-          # 注意: 不能直接改 gki_defconfig, Kleaf 会跑 savedefconfig 一致性检查,
-          #       配置项位置不对会报 "savedefconfig does not match" 错误.
-          # 正确做法: 用 defconfig_fragments 机制 (增量配置, 不经过 savedefconfig 检查)
-          #          参考 BUILD.bazel 里 kernel_aarch64_autofdo 的用法
-
-          # 注意: PID_NS 曾被怀疑导致启动失败, 但实际是 init_boot.img 缺失所致
-          #       (init_boot.img 在 GKI common dist 目录, 不在 msm-kernel dist, 之前漏收集)
-          #       既然用户确认之前 PID_NS 能启动, 这里全部加回
-          CUSTOM_CONFIGS=(
-            "CONFIG_SYSVIPC=y"
-            "CONFIG_POSIX_MQUEUE=y"
-            "CONFIG_IPC_NS=y"
-            "CONFIG_PID_NS=y"
-          )
-
-          # 1. 创建 fragment 文件
-          FRAGMENT_FILE="kernel_platform/common/arch/arm64/configs/custom_gki.fragment"
-          cat > "$FRAGMENT_FILE" << 'EOF'
-          # === Custom configs from CI ===
-          EOF
-          for config in "${CUSTOM_CONFIGS[@]}"; do
-            echo "$config" >> "$FRAGMENT_FILE"
-            echo "  + $config"
-          done
-          echo "✅ Created fragment: $FRAGMENT_FILE"
-          cat "$FRAGMENT_FILE"
-
-          # 2. patch BUILD.bazel, 给 kernel_aarch64 和 kernel_aarch64_16k 加上 defconfig_fragments
-          BUILD_FILE="kernel_platform/common/BUILD.bazel"
-          if [ ! -f "$BUILD_FILE" ]; then
-            echo "❌ $BUILD_FILE not found"
-            exit 1
-          fi
-
-          python3 - << 'PYEOF'
-          build_file = "kernel_platform/common/BUILD.bazel"
-          with open(build_file, "r") as f:
-              content = f.read()
-
-          fragment_line = '        "defconfig_fragments": ["arch/arm64/configs/custom_gki.fragment"],\n'
-
-          # 给 kernel_aarch64 和 kernel_aarch64_16k 加上 defconfig_fragments
-          # 这两个 target 用 define_common_kernels 定义, 在 target_configs 字典里
-          for target in ["kernel_aarch64", "kernel_aarch64_16k"]:
-              marker = '"' + target + '": {\n'
-              idx = content.find(marker)
-              if idx == -1:
-                  print(f"⚠️ {target} not found in BUILD.bazel, skip")
-                  continue
-              insert_pos = idx + len(marker)
-              # 检查这个 target 块里是否已经有 defconfig_fragments
-              # 找到下一个 "}," 作为块结束
-              block_end = content.find('},', insert_pos)
-              block = content[insert_pos:block_end]
-              if "defconfig_fragments" in block:
-                  print(f"✓ {target} already has defconfig_fragments, skip")
-                  continue
-              content = content[:insert_pos] + fragment_line + content[insert_pos:]
-              print(f"✓ Added defconfig_fragments to {target}")
-
-          with open(build_file, "w") as f:
-              f.write(content)
-          PYEOF
-
-          echo ""
-          echo "🔧 Verify: grep defconfig_fragments in BUILD.bazel"
-          grep -n "defconfig_fragments" "$BUILD_FILE" | head -10
-
-          # 3. patch msm_kernel_la.bzl: 让有 dtb_list 的平台也 dist init_boot.img
-          # 根因: msm_kernel_la.bzl 第 506 行
-          #   boot_image_outs = None if dtb_list else ["boot.img", "init_boot.img"]
-          # sun 平台有 dtb_list, 所以 boot_image_outs = None
-          # init_boot.img 在 boot_images action 里生成了 (日志可证), 但不是 declared output,
-          # 所以不会被 sun_perf_dist dist 到最终目录
-          # 修复: 有 dtb_list 时也把 init_boot.img 加到 boot_image_outs
-          MSM_KERNEL_LA="kernel_platform/msm-kernel/msm_kernel_la.bzl"
-          if [ ! -f "$MSM_KERNEL_LA" ]; then
-            echo "❌ $MSM_KERNEL_LA not found"
-            exit 1
-          fi
-
-          python3 - << 'PYEOF'
-          import re
-          bzl_file = "kernel_platform/msm-kernel/msm_kernel_la.bzl"
-          with open(bzl_file, "r") as f:
-              content = f.read()
-
-          old = 'boot_image_outs = None if dtb_list else ["boot.img", "init_boot.img"],'
-          new = 'boot_image_outs = ["init_boot.img"] if dtb_list else ["boot.img", "init_boot.img"],'
-          if old in content:
-              content = content.replace(old, new)
-              with open(bzl_file, "w") as f:
-                  f.write(content)
-              print(f"✓ Patched boot_image_outs in {bzl_file}")
-          elif new in content:
-              print(f"✓ boot_image_outs already patched, skip")
-          else:
-              print(f"⚠️ Could not find boot_image_outs line to patch!")
-              exit(1)
-          PYEOF
-
-          echo ""
-          echo "🔧 Verify: grep boot_image_outs in msm_kernel_la.bzl"
-          grep -n "boot_image_outs" "$MSM_KERNEL_LA" | head -10
-
-          # 4. 创建 build_with_bazel.py 在 __init__ 里会创建的符号链接
-          # (setup_extensions 方法, build_with_bazel.py:106-127)
-          # 虽然下面 oplus_build_kernel.sh -> build_with_bazel.py 会自动创建,
-          # 但提前创建可以避免某些竞态条件下首次加载失败的问题
-          echo ""
-          echo "🔗 Creating extension symlinks (mimic build_with_bazel.py setup_extensions)..."
-          cd kernel_platform
-          mkdir -p build
-          # build/msm_kernel_extensions.bzl → ../msm-kernel/msm_kernel_extensions.bzl
-          if [ ! -e build/msm_kernel_extensions.bzl ]; then
-            ln -sf ../msm-kernel/msm_kernel_extensions.bzl build/msm_kernel_extensions.bzl
-            echo "  + build/msm_kernel_extensions.bzl -> ../msm-kernel/msm_kernel_extensions.bzl"
-          else
-            echo "  = build/msm_kernel_extensions.bzl already exists"
-          fi
-          # build/abl_extensions.bzl → ../bootable/bootloader/edk2/abl_extensions.bzl
-          # 注: manifest 不包含 edk2 仓库, 这个符号链接会是 dead link, 但 skip_abl=true 时不影响
-          if [ ! -e build/abl_extensions.bzl ]; then
-            ln -sf ../bootable/bootloader/edk2/abl_extensions.bzl build/abl_extensions.bzl
-            echo "  + build/abl_extensions.bzl -> ../bootable/bootloader/edk2/abl_extensions.bzl (may be dead link)"
-          else
-            echo "  = build/abl_extensions.bzl already exists"
-          fi
-          ls -la build/*.bzl
-
-      - name: "🔍 Bazel cquery: Verify init_boot.img in output list"
-        run: |
-          set -uo pipefail
-          cd kernel_workspace/kernel_platform
-
-          echo "🔍 Querying //msm-kernel:${KERNEL_PLATFORM}_${KERNEL_VARIANT}_images output files..."
-          echo "(This only analyzes the build graph, does NOT compile. Takes ~1-2 minutes)"
-          echo ""
-
-          # 注意: 不用 set -e, 让 cquery 失败后能继续到下面的 if 判断给出清晰错误信息
-          # pipefail + || true 兜底, 保证管道退出码不触发退出
-          tools/bazel cquery \
-            --//msm-kernel:skip_abl=true \
-            --//msm-kernel:skip_abi=true \
-            --ignore_missing_projects \
-            --incompatible_sandbox_hermetic_tmp=false \
-            "//msm-kernel:${KERNEL_PLATFORM}_${KERNEL_VARIANT}_images" \
-            --output=files > cquery_output.txt 2>&1 || true
-
-          echo "=============================="
-          echo "🔍 cquery output (first 50 lines):"
-          echo "=============================="
-          head -50 cquery_output.txt
-          echo ""
-          echo "=============================="
-          echo "🔍 Checking init_boot.img in output list:"
-          echo "=============================="
-
-          if grep -q "init_boot.img" cquery_output.txt; then
-            echo "✅ init_boot.img IS in the output list (patch生效!)"
-            grep "init_boot" cquery_output.txt
-          else
-            echo "❌ init_boot.img NOT in output list (patch失败或语义理解错误)"
-            echo ""
-            echo "Full cquery output:"
-            cat cquery_output.txt
-            # 不 exit 1, 让后面的构建步骤继续运行, 看实际构建能否生成 init_boot.img
-            echo ""
-            echo "⚠️ Continuing anyway - actual build may still generate init_boot.img"
-          fi
-
-      - name: "📤 Upload cquery Output"
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: cquery_output
-          path: kernel_workspace/kernel_platform/cquery_output.txt
-          if-no-files-found: warn
-          retention-days: 7
-
       - name: "🔨 Build Kernel via Official Script"
         run: |
           set -euo pipefail
           cd kernel_workspace
-
-          # 官方构建命令 (来自 OnePlusOSS/kernel_manifest README 与 oplus_build_kernel.sh):
-          #   ./kernel_platform/oplus/build/oplus_build_kernel.sh <platform> <variant>
-          # 内部流程:
-          #   1. source oplus_setup.sh -> 设置 OPLUS_VND_BUILD_PLATFORM=SM8750, EXTRA_KBUILD_ARGS=--skip abl 等
-          #   2. 调用 ./kernel_platform/build/android/prepare_vendor.sh <platform> <variant>
-          #   3. prepare_vendor.sh 调用 brunch 生成 build.config, 然后执行:
-          #        build_with_bazel.py -t <platform> <variant> --out_dir out/msm-kernel-<platform>-<variant>
-          #   4. build_with_bazel.py 调用 tools/bazel build + tools/bazel run ..._dist -- --dist_dir=<out>/dist
-          #   5. 官方脚本直接产出 boot.img / dtbo.img / vendor_boot.img / vendor_dlkm.img 等
           ./kernel_platform/oplus/build/oplus_build_kernel.sh "${KERNEL_PLATFORM}" "${KERNEL_VARIANT}" 2>&1 | tee build_full.log
 
       - name: "📦 Collect Artifacts"
@@ -357,22 +125,11 @@ jobs:
           ls -la "$DIST_DIR" 2>/dev/null | head -30 || true
 
           mkdir -p Final-Image/modules
-          # boot.img: perf 变体来自 GKI common (avb_sign_boot_image 处理后 dist)
           cp -v "$DIST_DIR"/boot.img         Final-Image/ 2>/dev/null || true
-          # init_boot.img: 上面 patch 了 msm_kernel_la.bzl 的 boot_image_outs,
-          # 让有 dtb_list 的平台也声明 init_boot.img 为 output, 这样 sun_perf_dist 会 dist 它
-          cp -v "$DIST_DIR"/init_boot.img    Final-Image/ 2>/dev/null || {
-            echo "⚠️ init_boot.img not found in $DIST_DIR!"
-            echo "  Searching workspace for init_boot.img..."
-            find kernel_platform -name "init_boot.img" -type f 2>/dev/null | head -5
-          }
-          # dtbo.img / vendor_boot.img: sun 平台有 dtbo_list, 两个都会生成
+          cp -v "$DIST_DIR"/init_boot.img    Final-Image/ 2>/dev/null || true
           cp -v "$DIST_DIR"/dtbo.img         Final-Image/ 2>/dev/null || true
           cp -v "$DIST_DIR"/vendor_boot.img  Final-Image/ 2>/dev/null || true
-          # vendor_dlkm.img: build_vendor_dlkm 默认 True
           cp -v "$DIST_DIR"/vendor_dlkm.img  Final-Image/ 2>/dev/null || true
-          # 注: system_dlkm.img 不会单独生成 (bazel build_system_dlkm 默认 False)
-          #     super.img 也不收集 (会覆盖整个 super 分区, 风险大, 标准 GKI 刷机不需要)
 
           cp -v "$DIST_DIR"/Image            Final-Image/ 2>/dev/null || true
           cp -v "$DIST_DIR"/Image.gz         Final-Image/ 2>/dev/null || true
@@ -382,10 +139,7 @@ jobs:
           cp -v "$DIST_DIR"/abi.xml          Final-Image/ 2>/dev/null || true
           cp -v "$DIST_DIR"/abi_symbollist   Final-Image/ 2>/dev/null || true
 
-          # 内核模块
           find "$DIST_DIR" -maxdepth 1 -name '*.ko' -type f -exec cp -v {} Final-Image/modules/ \; 2>/dev/null || true
-
-          # 构建日志
           cp -v build_full.log Final-Image/ 2>/dev/null || true
 
           echo ""
