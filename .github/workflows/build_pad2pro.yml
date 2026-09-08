@@ -1,5 +1,4 @@
 name: Build SM8750 Pure GKI Kernel
-
 on:
   workflow_dispatch:
     inputs:
@@ -13,48 +12,33 @@ on:
         required: false
         type: boolean
         default: true
-
-permissions:
-  contents: read
-  actions: write
-
 jobs:
   build:
     name: OnePlus Pad 2 Pro SM8750 Pure GKI
     runs-on: ubuntu-24.04
     timeout-minutes: 480
-
     env:
       WORKSPACE: ${{ github.workspace }}/kernel_workspace
       MANIFEST_BRANCH: oneplus/sm8750
       MANIFEST_FILE: oneplus_pad_2_pro_b.xml
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 8G
-      # Bazel / Kleaf 常用优化
-      BAZEL_ARGS: "--config=fast"
-      USE_CCACHE: 1
-
     steps:
-      - name: Maximize Build Space
+      - name: "🚀 Maximize Build Space"
         uses: easimon/maximize-build-space@master
         with:
-          root-reserve-mb: 12288          # 12GB 留给系统，避免过大导致可用空间不足
-          temp-reserve-mb: 4096
-          swap-size-mb: 8192
+          root-reserve-mb: 24576
+          temp-reserve-mb: 8192
           remove-dotnet: "true"
           remove-android: "true"
           remove-haskell: "true"
           remove-codeql: "true"
-
-      - name: Show free disk space
-        run: df -h
-
-      - name: Install Build Dependencies
+      - name: "📦 Install Build Dependencies"
         shell: bash
         run: |
           set -euxo pipefail
-          sudo apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          sudo apt-get update
+          sudo apt-get install -y \
             python3 \
             python-is-python3 \
             git \
@@ -89,72 +73,53 @@ jobs:
             xsltproc \
             yasm \
             cpio \
-            repo \
-            file \
-            tree
-
-      - name: Configure ccache
+            repo
+          python3 --version
+          git --version
+          repo --version || true
+          clang --version
+          ld.lld --version
+      - name: "⚡ Configure ccache"
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p "$CCACHE_DIR"
           ccache --set-config=cache_dir="$CCACHE_DIR"
           ccache --set-config=max_size="$CCACHE_MAXSIZE"
-          ccache --set-config=compression=true
-          ccache --set-config=compression_level=6
-          ccache --zero-stats || true
           ccache --show-config
-
-      - name: Restore ccache
+      - name: "📦 Restore ccache"
         uses: actions/cache@v4
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: ccache-sm8750-pad2pro-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          key: ccache-sm8750-pad2pro-${{ github.run_id }}
           restore-keys: |
-            ccache-sm8750-pad2pro-${{ runner.os }}-${{ runner.arch }}-
             ccache-sm8750-pad2pro-
-
-      - name: Init Official OnePlus SM8750 Manifest
+      - name: "📥 Init Official OnePlus SM8750 Manifest"
         shell: bash
         run: |
           set -euxo pipefail
-          # 避免 repo 同步时的 git 警告
-          git config --global user.email "ci@github-actions.local"
-          git config --global user.name "GitHub Actions"
-          git config --global color.ui false
-          git config --global advice.detachedHead false
-
           rm -rf "$WORKSPACE"
           mkdir -p "$WORKSPACE"
           cd "$WORKSPACE"
-
           repo init \
             -u https://github.com/OnePlusOSS/kernel_manifest.git \
             -b "$MANIFEST_BRANCH" \
             -m "$MANIFEST_FILE" \
-            --depth=1 \
-            --no-repo-verify
-
-      - name: Sync OnePlus Kernel Source
+            --depth=1
+      - name: "📥 Sync OnePlus Kernel Source"
         shell: bash
         run: |
           set -euxo pipefail
           cd "$WORKSPACE"
-          # 大仓库同步，增加稳定性参数
           repo sync \
             -c \
             -j"$(nproc --all)" \
             --no-tags \
             --no-clone-bundle \
-            --force-sync \
-            --fail-fast \
-            --optimized-fetch \
-            --prune
+            --force-sync
           test -d "$WORKSPACE/kernel_platform"
-          echo "Sync completed. Disk usage:"
-          du -sh "$WORKSPACE" || true
-
-      - name: Verify GKI Source Tree
+          ls -lah "$WORKSPACE/kernel_platform"
+      - name: "🔎 Verify GKI Source Tree"
         shell: bash
         run: |
           set -euxo pipefail
@@ -164,70 +129,51 @@ jobs:
           test -d "$COMMON"
           test -f "$COMMON/BUILD.bazel"
           test -f "$COMMON/arch/arm64/configs/gki_defconfig"
+          echo "ROOT   = $ROOT"
+          echo "COMMON = $COMMON"
+          echo
           echo "=== Kernel version ==="
           grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)' "$COMMON/Makefile" || true
-          echo "=== tools/bazel exists? ==="
-          test -x "$ROOT/tools/bazel" && echo "Yes" || echo "No"
-
-      - name: Fetch Droidspaces-OSS
+      - name: "📥 Fetch Droidspaces-OSS"
         shell: bash
         run: |
           set -euxo pipefail
           rm -rf /tmp/Droidspaces-OSS
           git clone --depth=1 https://github.com/ravindu644/Droidspaces-OSS.git /tmp/Droidspaces-OSS
-          echo "Droidspaces-OSS commit: $(git -C /tmp/Droidspaces-OSS rev-parse HEAD)"
-
-      - name: Locate & Apply Droidspaces SYSVIPC kABI Patch
+          echo "Droidspaces revision:"
+          git -C /tmp/Droidspaces-OSS rev-parse HEAD
+      - name: "🩹 Locate Droidspaces SYSVIPC Patch"
         shell: bash
         run: |
           set -euxo pipefail
           PATCH_DIR="/tmp/Droidspaces-OSS/Documentation/resources/kernel-patches/GKI/below-kernel-6.12"
           test -d "$PATCH_DIR"
-
-          # 优先使用官方推荐的 6_7_8 版本
-          PATCH_FILE=""
-          for candidate in \
-            "001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch" \
-            "*sysvipc*kabi*6_7_8*.patch" \
-            "*sysvipc*kabi*.patch"
-          do
-            found=$(find "$PATCH_DIR" -maxdepth 1 -type f -iname "$candidate" | head -n 1 || true)
-            if [ -n "$found" ]; then
-              PATCH_FILE="$found"
-              break
-            fi
-          done
-
+          echo "Available patches:"
+          find "$PATCH_DIR" -maxdepth 1 -type f -print | sort
+          PATCH_FILE="$(find "$PATCH_DIR" -maxdepth 1 -type f -iname '*sysvipc*kabi*6_7_8*.patch' | head -n 1)"
           if [ -z "$PATCH_FILE" ]; then
-            echo "ERROR: SYSVIPC kABI patch not found under $PATCH_DIR"
-            ls -la "$PATCH_DIR" || true
+            echo "ERROR: SYSVIPC kABI patch not found."
             exit 1
           fi
-
+          echo "PATCH_FILE=$PATCH_FILE" >> "$GITHUB_ENV"
           echo "Selected patch: $PATCH_FILE"
+      - name: "🩹 Apply Droidspaces SYSVIPC kABI Patch"
+        shell: bash
+        run: |
+          set -euxo pipefail
           COMMON="$WORKSPACE/kernel_platform/common"
           cd "$COMMON"
-          # 使用 --forward，已应用则跳过
-          if patch --dry-run --forward -p1 < "$PATCH_FILE" > /dev/null 2>&1; then
-            patch --forward -p1 < "$PATCH_FILE"
-            echo "Patch applied successfully"
-          else
-            echo "Patch may already be applied or does not apply cleanly, checking..."
-            patch --forward -p1 < "$PATCH_FILE" || {
-              echo "WARNING: patch application had issues, continuing (may already applied)"
-            }
-          fi
+          echo "Applying patch: $PATCH_FILE"
+          patch --forward -p1 < "$PATCH_FILE"
+          echo "=== Patch result ==="
           git diff --stat || true
-
-      - name: Configure Droidspaces GKI Defconfig
+      - name: "⚙️ Configure Droidspaces GKI Defconfig (strict)"
         shell: bash
         run: |
           set -euxo pipefail
           COMMON="$WORKSPACE/kernel_platform/common"
           CONFIG="$COMMON/arch/arm64/configs/gki_defconfig"
           test -f "$CONFIG"
-          cp "$CONFIG" "$CONFIG.bak"
-
           REQUIRED_CONFIGS=(
             "CONFIG_SYSVIPC=y"
             "CONFIG_POSIX_MQUEUE=y"
@@ -236,7 +182,6 @@ jobs:
             "CONFIG_DEVTMPFS=y"
             "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y"
           )
-
           OPTIONAL_CONFIGS=(
             "CONFIG_USER_NS=y"
             "CONFIG_NETFILTER_XT_TARGET_REJECT=y"
@@ -249,205 +194,189 @@ jobs:
             "CONFIG_TMPFS_POSIX_ACL=y"
             "CONFIG_TMPFS_XATTR=y"
           )
-
           set_config() {
             local cfg="$1"
             local key="${cfg%%=*}"
             if grep -qE "^${key}=y$" "$CONFIG"; then
-              echo "[OK] Already enabled: $key"
+              echo "Already enabled: $key"
               return 0
             fi
             if grep -qE "^# ${key} is not set$" "$CONFIG"; then
               sed -i "s|^# ${key} is not set$|${cfg}|" "$CONFIG"
-              echo "[CHG] Changed to $cfg"
+              echo "Changed '# is not set' → $cfg"
               return 0
             fi
             if grep -qE "^${key}=.*$" "$CONFIG"; then
               sed -i "s|^${key}=.*$|${cfg}|" "$CONFIG"
-              echo "[UPD] Updated to $cfg"
+              echo "Updated existing → $cfg"
               return 0
             fi
             echo "$cfg" >> "$CONFIG"
-            echo "[ADD] Appended $cfg"
+            echo "Appended (not found): $cfg"
           }
-
+          echo "=== Required configs ==="
           for cfg in "${REQUIRED_CONFIGS[@]}"; do
             set_config "$cfg"
           done
-
           if [ "${{ inputs.APPLY_OPTIONAL_CONFIG }}" = "true" ]; then
-            echo "Applying optional configs..."
+            echo
+            echo "=== Optional configs ==="
             for cfg in "${OPTIONAL_CONFIGS[@]}"; do
               set_config "$cfg"
             done
           else
-            echo "Skipping optional configs"
+            echo
+            echo "Optional configs disabled."
           fi
-
-          echo "=== Relevant configs after modification ==="
+          echo
+          echo "=== Final relevant configs ==="
           grep -E '^CONFIG_(SYSVIPC|POSIX_MQUEUE|IPC_NS|PID_NS|DEVTMPFS|NETFILTER_XT_MATCH_ADDRTYPE|USER_NS)=' "$CONFIG" || true
+          echo
           echo "=== Diff ==="
-          diff -u "$CONFIG.bak" "$CONFIG" || true
-
-      - name: Disable check_defconfig
+          git -C "$COMMON" diff -- arch/arm64/configs/gki_defconfig || true
+      - name: "🔄 Update defconfig + Disable check_defconfig"
         shell: bash
         run: |
           set -euxo pipefail
           ROOT="$WORKSPACE/kernel_platform"
           cd "$ROOT"
-          cp common/BUILD.bazel common/BUILD.bazel.bak
-
-          python3 << 'PY'
-          import re
-          import sys
-
-          with open("common/BUILD.bazel", "r") as f:
-              content = f.read()
-
-          # 匹配 kernel_aarch64 目标
-          pattern = r'(name\s*=\s*"kernel_aarch64",)'
-          replacement = r'\1\n    check_defconfig = "disabled",'
-
-          new_content, count = re.subn(pattern, replacement, content, count=1)
-          if count == 0:
-              # 兜底：尝试更宽松的匹配
-              pattern2 = r'(name\s*=\s*"kernel_aarch64")'
-              replacement2 = r'\1,\n    check_defconfig = "disabled"'
-              new_content, count = re.subn(pattern2, replacement2, content, count=1)
-              if count == 0:
-                  print("ERROR: Could not find kernel_aarch64 target in BUILD.bazel")
-                  # 打印相关片段帮助调试
-                  for i, line in enumerate(content.splitlines(), 1):
-                      if "kernel_aarch64" in line:
-                          print(f"{i}: {line}")
-                  sys.exit(1)
-
-          with open("common/BUILD.bazel", "w") as f:
-              f.write(new_content)
-          print("Successfully injected check_defconfig = \"disabled\"")
-          PY
-
-          echo "=== Verified snippet ==="
-          grep -A 15 -E 'name\s*=\s*"kernel_aarch64"' common/BUILD.bazel || true
-
-      - name: Clean Bazel Build
+          echo "=== Attempt Bazel savedefconfig ==="
+          tools/bazel run --config=local //common:kernel_aarch64_config -- savedefconfig || true
+          echo
+          echo "=== Diff after savedefconfig attempt ==="
+          git -C common diff --stat -- arch/arm64/configs/gki_defconfig || true
+          echo
+          echo "=== Disable check_defconfig in BUILD.bazel ==="
+          BUILD_FILE="common/BUILD.bazel"
+          cp "$BUILD_FILE" "$BUILD_FILE.bak"
+          # 简单可靠的方式：在 kernel_aarch64 定义附近注入
+          sed -i '/name = "kernel_aarch64"/a\    check_defconfig = "disabled",' "$BUILD_FILE" || true
+          echo "=== Relevant BUILD.bazel content ==="
+          grep -A 15 -E 'name = "kernel_aarch64"' "$BUILD_FILE" || true
+      - name: "🔐 Verify / Force-Disable GKI KMI Settings"
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ROOT="$WORKSPACE/kernel_platform"
+          cd "$ROOT"
+          echo "=== KMI related settings (before force-disable) ==="
+          grep -R -n -E 'KMI_SYMBOL_LIST_STRICT_MODE|TRIM_NONLISTED_KMI|kmi_symbol_list_strict_mode|trim_nonlisted_kmi' . --exclude-dir=.git 2>/dev/null | head -100 || true
+          echo
+          echo "KMI trimming will be disabled at build time via --notrim + --nokmi_symbol_list_strict_mode"
+      - name: "🔎 Inspect Kleaf GKI Targets"
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ROOT="$WORKSPACE/kernel_platform"
+          cd "$ROOT"
+          tools/bazel query '//common:*' 2>&1 | tee "$GITHUB_WORKSPACE/bazel-common-targets.txt"
+          echo
+          grep -E 'kernel_aarch64_dist|kernel.*dist|gki' "$GITHUB_WORKSPACE/bazel-common-targets.txt" || true
+      - name: "🧹 Clean Bazel Build"
         if: ${{ inputs.CLEAN_BUILD }}
         shell: bash
         run: |
           set -euxo pipefail
           ROOT="$WORKSPACE/kernel_platform"
           cd "$ROOT"
-          if [ -x tools/bazel ]; then
-            tools/bazel clean --expunge || tools/bazel clean || true
-          fi
-          rm -rf out/dist out/common out/bazel out/.cache 2>/dev/null || true
-          echo "Clean completed"
-
-      - name: Build PURE GKI Kernel
+          tools/bazel clean
+          rm -rf "$ROOT/out/dist" "$ROOT/out/common" "$ROOT/out/bazel" "$ROOT/out/.cache" 2>/dev/null || true
+      - name: "🔨 Build PURE GKI Kernel (KMI trim DISABLED)"
         shell: bash
         run: |
           set -o pipefail
           ROOT="$WORKSPACE/kernel_platform"
-          DEST="${GITHUB_WORKSPACE}/Final-GKI-Image"
+          DEST="$GITHUB_WORKSPACE/Final-GKI-Image"
           mkdir -p "$DEST"
           cd "$ROOT"
-
-          echo "Starting pure GKI build..."
-          echo "Free space before build:"
-          df -h
-
-          # 构建并实时输出日志
-          tools/bazel run //common:kernel_aarch64_dist -- --destdir="$DEST" 2>&1 | tee "${GITHUB_WORKSPACE}/build-pure-gki.log"
+          echo "========================================"
+          echo "PURE GKI BUILD (KMI optimization DISABLED)"
+          echo "  --notrim                     → disables TRIM_NONLISTED_KMI"
+          echo "  --nokmi_symbol_list_strict_mode → disables strict KMI symbol list mode"
+          echo "========================================"
+          tools/bazel run \
+            --notrim \
+            --nokmi_symbol_list_strict_mode \
+            //common:kernel_aarch64_dist \
+            -- \
+            --destdir="$DEST" \
+            2>&1 | tee "$GITHUB_WORKSPACE/build-pure-gki.log"
           BUILD_EXIT=${PIPESTATUS[0]}
-
           if [ "$BUILD_EXIT" -ne 0 ]; then
-            echo "ERROR: Build failed with exit code $BUILD_EXIT"
-            echo "=== Last 100 lines of log ==="
-            tail -n 100 "${GITHUB_WORKSPACE}/build-pure-gki.log" || true
+            echo "ERROR: Pure GKI build failed. Exit code: $BUILD_EXIT"
             exit "$BUILD_EXIT"
           fi
-
-          echo "PURE GKI BUILD COMPLETED SUCCESSFULLY"
-          echo "Free space after build:"
-          df -h
-
-      - name: Inspect GKI Artifacts
+          echo "PURE GKI BUILD COMPLETED (KMI trim disabled)."
+      - name: "📦 Inspect GKI Artifacts"
         if: always()
         shell: bash
         run: |
           set -u
-          DEST="${GITHUB_WORKSPACE}/Final-GKI-Image"
+          DEST="$GITHUB_WORKSPACE/Final-GKI-Image"
+          echo "========================================"
+          echo "GKI ARTIFACTS"
+          echo "========================================"
           if [ ! -d "$DEST" ]; then
-            echo "Artifact directory does not exist: $DEST"
+            echo "Artifact directory does not exist."
             exit 1
           fi
-          echo "=== Artifacts listing ==="
-          find "$DEST" -type f -printf '%P\t%s bytes\n' | sort || true
-          echo
-          echo "=== Tree view (depth 2) ==="
-          tree -L 2 "$DEST" 2>/dev/null || find "$DEST" -maxdepth 2 -print
-
-      - name: Verify GKI Kernel Image
+          find "$DEST" -type f -printf '%P %s bytes\n' | sort || true
+      - name: "🧪 Verify GKI Kernel Image"
         if: always()
         shell: bash
         run: |
           set -u
-          DEST="${GITHUB_WORKSPACE}/Final-GKI-Image"
+          DEST="$GITHUB_WORKSPACE/Final-GKI-Image"
           IMAGE_FOUND=0
-
           for file in \
             "$DEST/Image" \
-            "$DEST/Image.gz" \
             "$DEST/Image.lz4" \
+            "$DEST/Image.gz" \
             "$DEST/Image.gz-dtb" \
             "$DEST/boot.img"
           do
             if [ -s "$file" ]; then
-              echo "Found usable image: $file ($(du -h "$file" | cut -f1))"
-              file "$file" || true
+              echo "Found: $file"
               IMAGE_FOUND=1
             fi
           done
-
           if [ "$IMAGE_FOUND" -eq 0 ]; then
-            echo "ERROR: No usable GKI kernel image found in $DEST"
-            echo "Full listing:"
+            echo "ERROR: No usable GKI kernel image found."
             find "$DEST" -type f -printf '%P %s bytes\n' | sort || true
             exit 1
           fi
-          echo "GKI artifact validation passed"
-
-      - name: Generate Build Metadata
+          echo "GKI artifact validation passed."
+      - name: "📝 Generate Build Metadata"
         if: always()
         shell: bash
         run: |
           set -u
-          DEST="${GITHUB_WORKSPACE}/Final-GKI-Image"
+          DEST="$GITHUB_WORKSPACE/Final-GKI-Image"
           mkdir -p "$DEST"
           {
+            echo "========================================"
             echo "OnePlus Pad 2 Pro SM8750 Pure GKI"
-            echo "================================="
+            echo "========================================"
             echo "Manifest branch : $MANIFEST_BRANCH"
             echo "Manifest file   : $MANIFEST_FILE"
             echo "Build system    : Kleaf / Bazel"
             echo "Build target    : //common:kernel_aarch64_dist"
+            echo "Build type      : PURE GKI"
             echo "check_defconfig : disabled"
             echo "Optional configs: ${{ inputs.APPLY_OPTIONAL_CONFIG }}"
-            echo "Clean build     : ${{ inputs.CLEAN_BUILD }}"
-            echo "Runner          : ${{ runner.os }} / ${{ runner.arch }}"
-            echo "GitHub SHA      : ${{ github.sha }}"
-            echo "Run ID          : ${{ github.run_id }}"
             echo
-            echo "Droidspaces-OSS commit:"
-            git -C /tmp/Droidspaces-OSS rev-parse HEAD 2>/dev/null || echo "N/A"
+            echo "KMI optimization: DISABLED"
+            echo "  - --notrim (TRIM_NONLISTED_KMI off)"
+            echo "  - --nokmi_symbol_list_strict_mode"
             echo
-            echo "Kernel version info:"
-            grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)' \
-              "$WORKSPACE/kernel_platform/common/Makefile" 2>/dev/null || true
+            echo "Droidspaces revision:"
+            git -C /tmp/Droidspaces-OSS rev-parse HEAD 2>/dev/null || true
+            echo
+            echo "Source revisions:"
+            cd "$WORKSPACE"
+            repo forall -c 'printf "%s " "$REPO_PATH"; git rev-parse HEAD' 2>/dev/null | sort | head -300 || true
           } > "$DEST/BUILD_INFO.txt"
-          cat "$DEST/BUILD_INFO.txt"
-
-      - name: Upload Pure GKI Artifacts
+      - name: "📤 Upload Pure GKI Artifacts"
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -457,18 +386,17 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           compression-level: 6
-
-      - name: Upload Build Logs
+      - name: "📤 Upload Build Logs"
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: oneplus_pad_2_pro_sm8750_pure_gki_logs
           path: |
             build-pure-gki.log
+            bazel-common-targets.txt
           if-no-files-found: warn
           retention-days: 14
-
-      - name: ccache Statistics
+      - name: "📊 ccache Statistics"
         if: always()
         shell: bash
         run: |
